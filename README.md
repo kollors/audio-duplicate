@@ -71,6 +71,20 @@ Target: 64-bit Windows 10/11. Event-driven WASAPI loopback is supported directly
 
 ## Build
 
+### GitHub Actions
+
+Open **Actions -> Build Windows EXE -> Run workflow**.
+
+Every push to `main` also starts a build automatically. When the build finishes, download the artifact named:
+
+```text
+AudioDuplicate-Windows-x64
+```
+
+The artifact contains `AudioDuplicate.exe`; nothing needs to be installed locally to build it.
+
+### Local build
+
 Recommended toolchain: Visual Studio 2022 with **Desktop development with C++** and CMake tools.
 
 From a Developer Command Prompt:
@@ -91,17 +105,20 @@ The MSVC runtime is linked statically (`/MT`) so the release executable does not
 
 ```text
 AudioDuplicate/
+  .github/
+    workflows/
+      build.yml
   CMakeLists.txt
   build_release.bat
   README.md
   res/
-    resources.rc      # version metadata
+    resources.rc
   src/
-    main.cpp           # Win32 GUI, scrolling output list, settings, localization
+    main.cpp
     audio.hpp
-    audio.cpp          # endpoint enumeration, loopback capture, render workers
+    audio.cpp
     config.hpp
-    config.cpp         # optional config file next to EXE only
+    config.cpp
 ```
 
 ## Portable-settings behavior
