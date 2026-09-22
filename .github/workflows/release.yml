@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - VERSION
+      - .release-trigger
   workflow_dispatch:
 
 permissions:
@@ -29,6 +30,9 @@ jobs:
           $base64 = ($parts | ForEach-Object { Get-Content $_.FullName -Raw }) -join ""
           [IO.File]::WriteAllBytes("source.zip", [Convert]::FromBase64String($base64))
           Expand-Archive "source.zip" -DestinationPath "stage" -Force
+          $cmake = Get-Content "stage/audio-duplicate/CMakeLists.txt" -Raw
+          $cmake = $cmake -replace '(?m)^\s*src/resource\.rc\s*\r?\n', ''
+          Set-Content "stage/audio-duplicate/CMakeLists.txt" $cmake -NoNewline
 
       - name: Read version
         id: version
