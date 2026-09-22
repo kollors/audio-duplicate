@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Threading;
+using System.Threading.Tasks;
 using NAudio.CoreAudioApi;
 using NAudio.Wave;
 
@@ -10,9 +12,8 @@ namespace AudioDuplicate
     internal sealed class AudioEngine : IDisposable
     {
         private readonly object _gate = new object();
-        private ProcessLoopbackCapture _capture;
+        private WasapiRecorder _capture;
         private MMDevice _sourceDevice;
-        private int _lastVolumeSyncTick;
         private readonly List<OutputWorker> _outputs = new List<OutputWorker>();
         private volatile bool _running;
         private string _lastError = "";
@@ -21,36 +22,44 @@ namespace AudioDuplicate
         private long _queuedBytes;
 
         public bool IsRunning => _running;
-        public string LastError { get { lock (_gate) return _lastError; } }
         public long CapturedBytes => Interlocked.Read(ref _capturedBytes);
         public long CapturedPackets => Interlocked.Read(ref _capturedPackets);
         public long QueuedBytes => Interlocked.Read(ref _queuedBytes);
         public bool HasCapturedAudio => CapturedPackets > 0;
 
+        public string ConsumeLastError()
+        {
+            lock (_gate)
+            {
+                var value = _lastError;
+                _lastError = "";
+                return value;
+            }
+        }
+
         public static List<AudioDevice> EnumerateRenderDevices()
         {
-            using (var enumerator = new MMDeviceEnumerator())
-            {
-                string defaultId = "";
-                try
-                {
-                    using (var def = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia))
-                        defaultId = def.ID;
-                }
-                catch { }
+            using var enumerator = new MMDeviceEnumerator();
 
-                return enumerator
-                    .EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active)
-                    .Select(d => new AudioDevice
-                    {
-                        Id = d.ID,
-                        Name = d.FriendlyName,
-                        IsDefault = d.ID == defaultId
-                    })
-                    .OrderByDescending(d => d.IsDefault)
-                    .ThenBy(d => d.Name, StringComparer.CurrentCultureIgnoreCase)
-                    .ToList();
+            string defaultId = "";
+            try
+            {
+                using var def = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+                defaultId = def.ID;
             }
+            catch { }
+
+            return enumerator
+                .EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active)
+                .Select(d => new AudioDevice
+                {
+                    Id = d.ID,
+                    Name = d.FriendlyName,
+                    IsDefault = d.ID == defaultId
+                })
+                .OrderByDescending(d => d.IsDefault)
+                .ThenBy(d => d.Name, StringComparer.CurrentCultureIgnoreCase)
+                .ToList();
         }
 
         public bool Start(string sourceDeviceId, ChannelMode sourceMode, IList<OutputRoute> outputs, out string error)
@@ -97,9 +106,24 @@ namespace AudioDuplicate
 
             try
             {
-                var enumerator = new MMDeviceEnumerator();
+                using var enumerator = new MMDeviceEnumerator();
                 _sourceDevice = enumerator.GetDevice(sourceDeviceId);
-                _capture = new ProcessLoopbackCapture();
+
+                // NAudio 3 owns the ActivateAudioInterfaceAsync interop. Build it on
+                // a worker thread because WinForms Main runs in an STA.
+                _capture = Task.Run(async () =>
+                    await new WasapiRecorderBuilder()
+                        .WithProcessLoopback(
+                            unchecked((uint)Process.GetCurrentProcess().Id),
+                            ProcessLoopbackMode.ExcludeTargetProcessTree)
+                        .WithFormat(new WaveFormat(48000, 16, 2))
+                        .WithBufferLength(10)
+                        .WithEventSync()
+                        .WithMmcssThreadPriority("Pro Audio")
+                        .BuildAsync())
+                    .GetAwaiter()
+                    .GetResult();
+
                 var sourceFormat = _capture.WaveFormat;
 
                 lock (_gate)
@@ -112,48 +136,43 @@ namespace AudioDuplicate
                             sourceFormat,
                             ex => SetError(ex.Message));
                         worker.Start();
+                        worker.NormalizeEndpointVolume();
                         _outputs.Add(worker);
                     }
                 }
 
-                lock (_gate)
-                {
-                    foreach (var output in _outputs)
-                        output.NormalizeEndpointVolume();
-                }
-
-                _capture.DataAvailable += (s, e) =>
+                _capture.DataAvailable += (buffer, flags, devicePosition, qpcPosition) =>
                 {
                     try
                     {
-                        if (!_running || e.BytesRecorded <= 0) return;
-                        Interlocked.Add(ref _capturedBytes, e.BytesRecorded);
+                        if (!_running || buffer.IsEmpty) return;
+
+                        var input = buffer.ToArray();
+                        Interlocked.Add(ref _capturedBytes, input.Length);
                         Interlocked.Increment(ref _capturedPackets);
 
-                        var input = new byte[e.BytesRecorded];
-                        Buffer.BlockCopy(e.Buffer, 0, input, 0, e.BytesRecorded);
+                        float sourceGain = 1f;
+                        try
+                        {
+                            var endpointVolume = _sourceDevice.AudioEndpointVolume;
+                            sourceGain = endpointVolume.Mute
+                                ? 0f
+                                : endpointVolume.MasterVolumeLevelScalar;
+                        }
+                        catch { }
 
                         lock (_gate)
                         {
                             foreach (var worker in _outputs)
                             {
-                                float sourceGain = 1f;
-                                try
-                                {
-                                    var endpointVolume = _sourceDevice.AudioEndpointVolume;
-                                    sourceGain = endpointVolume.Mute
-                                        ? 0f
-                                        : endpointVolume.MasterVolumeLevelScalar;
-                                }
-                                catch { }
-
                                 var routed = RouteAudio(
                                     input,
-                                    e.BytesRecorded,
+                                    input.Length,
                                     sourceFormat,
                                     sourceMode,
                                     worker.Mode,
                                     sourceGain);
+
                                 worker.AddSamples(routed, routed.Length);
                                 Interlocked.Add(ref _queuedBytes, routed.Length);
                             }
@@ -173,16 +192,15 @@ namespace AudioDuplicate
 
                 _running = true;
                 _capture.StartRecording();
-                enumerator.Dispose();
 
                 error = "";
                 return true;
             }
             catch (Exception ex)
             {
-                SetError(ex.Message);
+                error = Describe(ex);
+                SetError(error);
                 Stop();
-                error = ex.Message;
                 return false;
             }
         }
@@ -191,21 +209,11 @@ namespace AudioDuplicate
         {
             _running = false;
 
-            try
+            if (_capture != null)
             {
-                if (_capture != null)
-                {
-                    try { _capture.StopRecording(); } catch { }
-                    _capture.Dispose();
-                    _capture = null;
-                }
-            }
-            catch { }
-
-            if (_sourceDevice != null)
-            {
-                try { _sourceDevice.Dispose(); } catch { }
-                _sourceDevice = null;
+                try { _capture.StopRecording(); } catch { }
+                try { _capture.Dispose(); } catch { }
+                _capture = null;
             }
 
             lock (_gate)
@@ -216,6 +224,12 @@ namespace AudioDuplicate
                 }
                 _outputs.Clear();
             }
+
+            if (_sourceDevice != null)
+            {
+                try { _sourceDevice.Dispose(); } catch { }
+                _sourceDevice = null;
+            }
         }
 
         private void SetError(string message)
@@ -223,10 +237,23 @@ namespace AudioDuplicate
             lock (_gate) _lastError = message ?? "";
         }
 
+        private static string Describe(Exception ex)
+        {
+            if (ex == null) return "";
+            return ex.HResult != 0
+                ? ex.Message + " (HRESULT: 0x" + ex.HResult.ToString("X8") + ")"
+                : ex.Message;
+        }
+
         public void Dispose() => Stop();
 
-        private static byte[] RouteAudio(byte[] input, int bytesRecorded, WaveFormat format,
-            ChannelMode sourceMode, ChannelMode outputMode, float gain)
+        private static byte[] RouteAudio(
+            byte[] input,
+            int bytesRecorded,
+            WaveFormat format,
+            ChannelMode sourceMode,
+            ChannelMode outputMode,
+            float gain)
         {
             int channels = Math.Max(1, format.Channels);
             int bits = format.BitsPerSample;
@@ -273,6 +300,7 @@ namespace AudioDuplicate
                 else
                 {
                     float selected = sourceMode == ChannelMode.Left ? left : right;
+
                     if (outputMode == ChannelMode.Stereo)
                     {
                         outLeft = selected;
@@ -373,7 +401,7 @@ namespace AudioDuplicate
         {
             private readonly MMDevice _device;
             private readonly BufferedWaveProvider _buffer;
-            private WasapiOut _player;
+            private readonly WasapiPlayer _player;
             private readonly Action<Exception> _onError;
             private readonly float _originalMasterVolume;
             private readonly bool _originalMute;
@@ -405,44 +433,25 @@ namespace AudioDuplicate
                 _buffer = new BufferedWaveProvider(sourceFormat)
                 {
                     DiscardOnBufferOverflow = true,
-                    BufferDuration = TimeSpan.FromMilliseconds(150)
+                    BufferDuration = TimeSpan.FromMilliseconds(120)
                 };
 
-                // Low-latency shared WASAPI. With the explicit Media Foundation
-                // resampler removed, event-driven rendering works reliably for
-                // normal DP/HDMI endpoints while cutting the extra render delay
-                // from ~100 ms to roughly one or two audio-engine periods.
-                try
-                {
-                    _player = CreatePlayer(eventSync: true, latencyMs: 20);
-                    _player.Init(_buffer);
-                }
-                catch
-                {
-                    try { _player?.Dispose(); } catch { }
+                _player = new WasapiPlayerBuilder()
+                    .WithDevice(_device)
+                    .WithSharedMode()
+                    .WithEventSync()
+                    .WithLatency(10)
+                    .WithLowLatency()
+                    .WithMmcssThreadPriority("Pro Audio")
+                    .Build();
 
-                    // Conservative fallback for drivers that reject a small
-                    // event-driven shared buffer.
-                    _player = CreatePlayer(eventSync: false, latencyMs: 40);
-                    _player.Init(_buffer);
-                }
-            }
-
-            private WasapiOut CreatePlayer(bool eventSync, int latencyMs)
-            {
-                var player = new WasapiOut(
-                    _device,
-                    AudioClientShareMode.Shared,
-                    eventSync,
-                    latencyMs);
-
-                player.PlaybackStopped += (s, e) =>
+                _player.PlaybackStopped += (s, e) =>
                 {
                     if (e.Exception != null)
                         _onError?.Invoke(e.Exception);
                 };
 
-                return player;
+                _player.Init(_buffer);
             }
 
             public void NormalizeEndpointVolume()
@@ -473,10 +482,9 @@ namespace AudioDuplicate
                 if (_player.PlaybackState != PlaybackState.Playing)
                     throw new InvalidOperationException("Дополнительный аудиовыход остановился.");
 
-                // Never let clock drift between two physical DP/HDMI endpoints
-                // turn into a steadily increasing audible delay. If the queued
-                // audio grows beyond 60 ms, jump back to the live edge.
-                if (_buffer.BufferedDuration > TimeSpan.FromMilliseconds(60))
+                // Keep only a very small live backlog. Two physical endpoints have
+                // independent clocks, so stale queued data must never accumulate.
+                if (_buffer.BufferedDuration > TimeSpan.FromMilliseconds(25))
                     _buffer.ClearBuffer();
 
                 _buffer.AddSamples(data, 0, count);
@@ -485,7 +493,7 @@ namespace AudioDuplicate
             public void Dispose()
             {
                 try { _player.Stop(); } catch { }
-                _player.Dispose();
+                try { _player.Dispose(); } catch { }
 
                 if (_volumeNormalized)
                 {
@@ -498,7 +506,7 @@ namespace AudioDuplicate
                     catch { }
                 }
 
-                _device.Dispose();
+                try { _device.Dispose(); } catch { }
             }
         }
     }
