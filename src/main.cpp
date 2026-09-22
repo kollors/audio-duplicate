@@ -257,7 +257,7 @@ private:
         if (!hwnd_) return;
         RECT rc{};
         GetClientRect(hwnd_, &rc);
-        const int page = std::max(1, static_cast<int>(rc.bottom - rc.top));
+        const int page = std::max<int>(1, static_cast<int>(rc.bottom - rc.top));
         const int maxPos = std::max(0, contentHeight_ - page);
         if (scrollPos_ > maxPos) scrollPos_ = maxPos;
 
@@ -274,7 +274,7 @@ private:
     void HandleVScroll(int code, int trackPos) {
         RECT rc{};
         GetClientRect(hwnd_, &rc);
-        const int page = std::max(1, static_cast<int>(rc.bottom - rc.top));
+        const int page = std::max<int>(1, static_cast<int>(rc.bottom - rc.top));
         int next = scrollPos_;
         switch (code) {
             case SB_LINEUP: next -= 36; break;
@@ -295,7 +295,7 @@ private:
     void SetScrollPosition(int next) {
         RECT rc{};
         GetClientRect(hwnd_, &rc);
-        const int page = std::max(1, static_cast<int>(rc.bottom - rc.top));
+        const int page = std::max<int>(1, static_cast<int>(rc.bottom - rc.top));
         const int maxPos = std::max(0, contentHeight_ - page);
         next = std::max(0, std::min(maxPos, next));
         if (next == scrollPos_) return;
