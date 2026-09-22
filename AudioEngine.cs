@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 using NAudio.CoreAudioApi;
 using NAudio.Wave;
 
@@ -13,9 +14,16 @@ namespace AudioDuplicate
         private readonly List<OutputWorker> _outputs = new List<OutputWorker>();
         private volatile bool _running;
         private string _lastError = "";
+        private long _capturedBytes;
+        private long _capturedPackets;
+        private long _queuedBytes;
 
         public bool IsRunning => _running;
         public string LastError { get { lock (_gate) return _lastError; } }
+        public long CapturedBytes => Interlocked.Read(ref _capturedBytes);
+        public long CapturedPackets => Interlocked.Read(ref _capturedPackets);
+        public long QueuedBytes => Interlocked.Read(ref _queuedBytes);
+        public bool HasCapturedAudio => CapturedPackets > 0;
 
         public static List<AudioDevice> EnumerateRenderDevices()
         {
@@ -47,6 +55,9 @@ namespace AudioDuplicate
         {
             Stop();
             SetError("");
+            Interlocked.Exchange(ref _capturedBytes, 0);
+            Interlocked.Exchange(ref _capturedPackets, 0);
+            Interlocked.Exchange(ref _queuedBytes, 0);
 
             if (string.IsNullOrWhiteSpace(sourceDeviceId))
             {
@@ -93,7 +104,11 @@ namespace AudioDuplicate
                 {
                     foreach (var route in outputs)
                     {
-                        var worker = new OutputWorker(enumerator.GetDevice(route.DeviceId), route.Mode, sourceFormat);
+                        var worker = new OutputWorker(
+                            enumerator.GetDevice(route.DeviceId),
+                            route.Mode,
+                            sourceFormat,
+                            ex => SetError(ex.Message));
                         worker.Start();
                         _outputs.Add(worker);
                     }
@@ -104,6 +119,9 @@ namespace AudioDuplicate
                     try
                     {
                         if (!_running || e.BytesRecorded <= 0) return;
+                        Interlocked.Add(ref _capturedBytes, e.BytesRecorded);
+                        Interlocked.Increment(ref _capturedPackets);
+
                         var input = new byte[e.BytesRecorded];
                         Buffer.BlockCopy(e.Buffer, 0, input, 0, e.BytesRecorded);
 
@@ -113,6 +131,7 @@ namespace AudioDuplicate
                             {
                                 var routed = RouteAudio(input, e.BytesRecorded, sourceFormat, sourceMode, worker.Mode);
                                 worker.AddSamples(routed, routed.Length);
+                                Interlocked.Add(ref _queuedBytes, routed.Length);
                             }
                         }
                     }
@@ -321,36 +340,63 @@ namespace AudioDuplicate
         {
             private readonly MMDevice _device;
             private readonly BufferedWaveProvider _buffer;
-            private readonly MediaFoundationResampler _resampler;
             private readonly WasapiOut _player;
+            private readonly Action<Exception> _onError;
 
             public ChannelMode Mode { get; }
 
-            public OutputWorker(MMDevice device, ChannelMode mode, WaveFormat sourceFormat)
+            public OutputWorker(
+                MMDevice device,
+                ChannelMode mode,
+                WaveFormat sourceFormat,
+                Action<Exception> onError)
             {
                 _device = device;
                 Mode = mode;
+                _onError = onError;
 
                 _buffer = new BufferedWaveProvider(sourceFormat)
                 {
                     DiscardOnBufferOverflow = true,
-                    BufferDuration = TimeSpan.FromMilliseconds(500)
+                    BufferDuration = TimeSpan.FromMilliseconds(750)
                 };
 
-                var targetFormat = _device.AudioClient.MixFormat;
-                _resampler = new MediaFoundationResampler(_buffer, targetFormat)
+                // Shared-mode WasapiOut enables Windows' AutoConvertPcm itself.
+                // Do not put Media Foundation between a realtime loopback stream
+                // and the render endpoint; it is unnecessary here and can stall
+                // the live pipeline on some endpoint/driver combinations.
+                //
+                // Timer-driven rendering is intentionally used instead of event
+                // sync. It is a little less "clever", but more tolerant of DP/HDMI
+                // audio endpoints exposed by GPU drivers.
+                _player = new WasapiOut(
+                    _device,
+                    AudioClientShareMode.Shared,
+                    false,
+                    100);
+
+                _player.PlaybackStopped += (s, e) =>
                 {
-                    ResamplerQuality = 60
+                    if (e.Exception != null)
+                        _onError?.Invoke(e.Exception);
                 };
 
-                _player = new WasapiOut(_device, AudioClientShareMode.Shared, true, 80);
-                _player.Init(_resampler);
+                _player.Init(_buffer);
             }
 
-            public void Start() => _player.Play();
+            public void Start()
+            {
+                _player.Play();
+
+                if (_player.PlaybackState != PlaybackState.Playing)
+                    throw new InvalidOperationException("Дополнительный аудиовыход не запустился.");
+            }
 
             public void AddSamples(byte[] data, int count)
             {
+                if (_player.PlaybackState != PlaybackState.Playing)
+                    throw new InvalidOperationException("Дополнительный аудиовыход остановился.");
+
                 _buffer.AddSamples(data, 0, count);
             }
 
@@ -358,7 +404,6 @@ namespace AudioDuplicate
             {
                 try { _player.Stop(); } catch { }
                 _player.Dispose();
-                _resampler.Dispose();
                 _device.Dispose();
             }
         }
