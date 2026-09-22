@@ -11,6 +11,8 @@ namespace AudioDuplicate
     {
         private readonly object _gate = new object();
         private WasapiLoopbackCapture _capture;
+        private MMDevice _sourceDevice;
+        private int _lastVolumeSyncTick;
         private readonly List<OutputWorker> _outputs = new List<OutputWorker>();
         private volatile bool _running;
         private string _lastError = "";
@@ -96,8 +98,8 @@ namespace AudioDuplicate
             try
             {
                 var enumerator = new MMDeviceEnumerator();
-                var source = enumerator.GetDevice(sourceDeviceId);
-                _capture = new WasapiLoopbackCapture(source);
+                _sourceDevice = enumerator.GetDevice(sourceDeviceId);
+                _capture = new WasapiLoopbackCapture(_sourceDevice);
                 var sourceFormat = _capture.WaveFormat;
 
                 lock (_gate)
@@ -114,6 +116,8 @@ namespace AudioDuplicate
                     }
                 }
 
+                SyncOutputVolumes();
+
                 _capture.DataAvailable += (s, e) =>
                 {
                     try
@@ -121,6 +125,13 @@ namespace AudioDuplicate
                         if (!_running || e.BytesRecorded <= 0) return;
                         Interlocked.Add(ref _capturedBytes, e.BytesRecorded);
                         Interlocked.Increment(ref _capturedPackets);
+
+                        int now = Environment.TickCount;
+                        if (unchecked(now - _lastVolumeSyncTick) >= 250)
+                        {
+                            _lastVolumeSyncTick = now;
+                            SyncOutputVolumes();
+                        }
 
                         var input = new byte[e.BytesRecorded];
                         Buffer.BlockCopy(e.Buffer, 0, input, 0, e.BytesRecorded);
@@ -178,6 +189,12 @@ namespace AudioDuplicate
             }
             catch { }
 
+            if (_sourceDevice != null)
+            {
+                try { _sourceDevice.Dispose(); } catch { }
+                _sourceDevice = null;
+            }
+
             lock (_gate)
             {
                 foreach (var output in _outputs)
@@ -185,6 +202,27 @@ namespace AudioDuplicate
                     try { output.Dispose(); } catch { }
                 }
                 _outputs.Clear();
+            }
+        }
+
+        private void SyncOutputVolumes()
+        {
+            if (_sourceDevice == null) return;
+
+            try
+            {
+                float volume = _sourceDevice.AudioEndpointVolume.MasterVolumeLevelScalar;
+                bool muted = _sourceDevice.AudioEndpointVolume.Mute;
+
+                lock (_gate)
+                {
+                    foreach (var output in _outputs)
+                        output.SyncEndpointVolume(volume, muted);
+                }
+            }
+            catch (Exception ex)
+            {
+                SetError("Не удалось синхронизировать громкость: " + ex.Message);
             }
         }
 
@@ -340,7 +378,7 @@ namespace AudioDuplicate
         {
             private readonly MMDevice _device;
             private readonly BufferedWaveProvider _buffer;
-            private readonly WasapiOut _player;
+            private WasapiOut _player;
             private readonly Action<Exception> _onError;
 
             public ChannelMode Mode { get; }
@@ -358,30 +396,60 @@ namespace AudioDuplicate
                 _buffer = new BufferedWaveProvider(sourceFormat)
                 {
                     DiscardOnBufferOverflow = true,
-                    BufferDuration = TimeSpan.FromMilliseconds(750)
+                    BufferDuration = TimeSpan.FromMilliseconds(150)
                 };
 
-                // Shared-mode WasapiOut enables Windows' AutoConvertPcm itself.
-                // Do not put Media Foundation between a realtime loopback stream
-                // and the render endpoint; it is unnecessary here and can stall
-                // the live pipeline on some endpoint/driver combinations.
-                //
-                // Timer-driven rendering is intentionally used instead of event
-                // sync. It is a little less "clever", but more tolerant of DP/HDMI
-                // audio endpoints exposed by GPU drivers.
-                _player = new WasapiOut(
+                // Low-latency shared WASAPI. With the explicit Media Foundation
+                // resampler removed, event-driven rendering works reliably for
+                // normal DP/HDMI endpoints while cutting the extra render delay
+                // from ~100 ms to roughly one or two audio-engine periods.
+                try
+                {
+                    _player = CreatePlayer(eventSync: true, latencyMs: 20);
+                    _player.Init(_buffer);
+                }
+                catch
+                {
+                    try { _player?.Dispose(); } catch { }
+
+                    // Conservative fallback for drivers that reject a small
+                    // event-driven shared buffer.
+                    _player = CreatePlayer(eventSync: false, latencyMs: 40);
+                    _player.Init(_buffer);
+                }
+            }
+
+            private WasapiOut CreatePlayer(bool eventSync, int latencyMs)
+            {
+                var player = new WasapiOut(
                     _device,
                     AudioClientShareMode.Shared,
-                    false,
-                    100);
+                    eventSync,
+                    latencyMs);
 
-                _player.PlaybackStopped += (s, e) =>
+                player.PlaybackStopped += (s, e) =>
                 {
                     if (e.Exception != null)
                         _onError?.Invoke(e.Exception);
                 };
 
-                _player.Init(_buffer);
+                return player;
+            }
+
+            public void SyncEndpointVolume(float volume, bool muted)
+            {
+                try
+                {
+                    var endpoint = _device.AudioEndpointVolume;
+                    if (Math.Abs(endpoint.MasterVolumeLevelScalar - volume) > 0.001f)
+                        endpoint.MasterVolumeLevelScalar = volume;
+                    if (endpoint.Mute != muted)
+                        endpoint.Mute = muted;
+                }
+                catch (Exception ex)
+                {
+                    _onError?.Invoke(ex);
+                }
             }
 
             public void Start()
@@ -396,6 +464,12 @@ namespace AudioDuplicate
             {
                 if (_player.PlaybackState != PlaybackState.Playing)
                     throw new InvalidOperationException("Дополнительный аудиовыход остановился.");
+
+                // Never let clock drift between two physical DP/HDMI endpoints
+                // turn into a steadily increasing audible delay. If the queued
+                // audio grows beyond 60 ms, jump back to the live edge.
+                if (_buffer.BufferedDuration > TimeSpan.FromMilliseconds(60))
+                    _buffer.ClearBuffer();
 
                 _buffer.AddSamples(data, 0, count);
             }
