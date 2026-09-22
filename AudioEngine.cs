@@ -1,88 +1,46 @@
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
-using System.Runtime.InteropServices;
-using System.Threading;
+using NAudio.CoreAudioApi;
+using NAudio.Wave;
 
 namespace AudioDuplicate
 {
     internal sealed class AudioEngine : IDisposable
     {
-        private Thread _captureThread;
-        private volatile bool _stop;
+        private readonly object _gate = new object();
+        private WasapiLoopbackCapture _capture;
+        private readonly List<OutputWorker> _outputs = new List<OutputWorker>();
         private volatile bool _running;
         private string _lastError = "";
-        private readonly object _errorLock = new object();
-        private readonly List<RendererWorker> _renderers = new List<RendererWorker>();
 
         public bool IsRunning => _running;
-        public string LastError { get { lock (_errorLock) return _lastError; } }
+        public string LastError { get { lock (_gate) return _lastError; } }
 
         public static List<AudioDevice> EnumerateRenderDevices()
         {
-            var result = new List<AudioDevice>();
-            IMMDeviceEnumerator en = null;
-            IMMDeviceCollection col = null;
-            IMMDevice defaultDev = null;
-
-            try
+            using (var enumerator = new MMDeviceEnumerator())
             {
-                en = (IMMDeviceEnumerator)Activator.CreateInstance(
-                    Type.GetTypeFromCLSID(CoreAudioIds.ClsidMmDeviceEnumerator));
-
                 string defaultId = "";
-                if (en.GetDefaultAudioEndpoint(EDataFlow.eRender, ERole.eConsole, out defaultDev) >= 0 && defaultDev != null)
-                    defaultDev.GetId(out defaultId);
-
-                if (en.EnumAudioEndpoints(EDataFlow.eRender, DeviceState.Active, out col) < 0 || col == null)
-                    return result;
-
-                col.GetCount(out uint count);
-                for (uint i = 0; i < count; i++)
+                try
                 {
-                    IMMDevice dev = null;
-                    IPropertyStore store = null;
-                    try
-                    {
-                        if (col.Item(i, out dev) < 0 || dev == null) continue;
-                        dev.GetId(out string id);
-                        string name = "Аудиоустройство";
-
-                        if (dev.OpenPropertyStore(Native.STGM_READ, out store) >= 0 && store != null)
-                        {
-                            var key = CoreAudioIds.PkeyDeviceFriendlyName;
-                            if (store.GetValue(ref key, out PropVariant pv) >= 0)
-                            {
-                                try
-                                {
-                                    if (pv.vt == 31 && pv.pointerValue != IntPtr.Zero)
-                                        name = Marshal.PtrToStringUni(pv.pointerValue) ?? name;
-                                }
-                                finally { Native.PropVariantClear(ref pv); }
-                            }
-                        }
-
-                        result.Add(new AudioDevice { Id = id, Name = name, IsDefault = id == defaultId });
-                    }
-                    finally
-                    {
-                        if (store != null) Marshal.ReleaseComObject(store);
-                        if (dev != null) Marshal.ReleaseComObject(dev);
-                    }
+                    using (var def = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia))
+                        defaultId = def.ID;
                 }
-            }
-            catch { }
-            finally
-            {
-                if (defaultDev != null) Marshal.ReleaseComObject(defaultDev);
-                if (col != null) Marshal.ReleaseComObject(col);
-                if (en != null) Marshal.ReleaseComObject(en);
-            }
+                catch { }
 
-            return result.OrderByDescending(x => x.IsDefault)
-                         .ThenBy(x => x.Name, StringComparer.CurrentCultureIgnoreCase)
-                         .ToList();
+                return enumerator
+                    .EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active)
+                    .Select(d => new AudioDevice
+                    {
+                        Id = d.ID,
+                        Name = d.FriendlyName,
+                        IsDefault = d.ID == defaultId
+                    })
+                    .OrderByDescending(d => d.IsDefault)
+                    .ThenBy(d => d.Name, StringComparer.CurrentCultureIgnoreCase)
+                    .ToList();
+            }
         }
 
         public bool Start(string sourceDeviceId, ChannelMode sourceMode, IList<OutputRoute> outputs, out string error)
@@ -95,426 +53,313 @@ namespace AudioDuplicate
                 error = "Выберите основной выход.";
                 return false;
             }
+
             if (outputs == null || outputs.Count == 0)
             {
                 error = "Добавьте хотя бы один дополнительный выход.";
                 return false;
             }
 
-            var ids = new HashSet<string>(StringComparer.Ordinal);
-            foreach (var o in outputs)
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var route in outputs)
             {
-                if (string.IsNullOrWhiteSpace(o.DeviceId))
+                if (string.IsNullOrWhiteSpace(route.DeviceId))
                 {
                     error = "Выберите устройство для каждого дополнительного выхода.";
                     return false;
                 }
-                if (o.DeviceId == sourceDeviceId)
+
+                if (string.Equals(route.DeviceId, sourceDeviceId, StringComparison.Ordinal))
                 {
                     error = "Основной и дополнительный выход не должны быть одним устройством.";
                     return false;
                 }
-                if (!ids.Add(o.DeviceId))
+
+                if (!seen.Add(route.DeviceId))
                 {
                     error = "Одно дополнительное устройство выбрано несколько раз.";
                     return false;
                 }
             }
 
-            _stop = false;
-            _running = true;
-
-            var copy = outputs.Select(x => new OutputRoute { DeviceId = x.DeviceId, Mode = x.Mode }).ToList();
-            _captureThread = new Thread(() => CaptureLoop(sourceDeviceId, sourceMode, copy))
-            {
-                IsBackground = true,
-                Name = "AudioDuplicate Capture"
-            };
-            _captureThread.Start();
-            error = "";
-            return true;
-        }
-
-        public void Stop()
-        {
-            _stop = true;
-
-            lock (_renderers)
-            {
-                foreach (var r in _renderers) r.Stop();
-            }
-
-            if (_captureThread != null && _captureThread.IsAlive)
-                _captureThread.Join(2000);
-            _captureThread = null;
-
-            lock (_renderers)
-            {
-                foreach (var r in _renderers) r.Dispose();
-                _renderers.Clear();
-            }
-            _running = false;
-        }
-
-        private void CaptureLoop(string sourceId, ChannelMode sourceMode, List<OutputRoute> outputs)
-        {
-            IMMDeviceEnumerator en = null;
-            IMMDevice source = null;
-            IAudioClient audioClient = null;
-            IAudioCaptureClient capture = null;
-            IntPtr mixPtr = IntPtr.Zero;
-            IntPtr evt = IntPtr.Zero;
-
             try
             {
-                en = (IMMDeviceEnumerator)Activator.CreateInstance(
-                    Type.GetTypeFromCLSID(CoreAudioIds.ClsidMmDeviceEnumerator));
+                var enumerator = new MMDeviceEnumerator();
+                var source = enumerator.GetDevice(sourceDeviceId);
+                _capture = new WasapiLoopbackCapture(source);
+                var sourceFormat = _capture.WaveFormat;
 
-                if (en.GetDevice(sourceId, out source) < 0 || source == null)
-                    throw new InvalidOperationException("Основное аудиоустройство недоступно.");
-
-                var iidAudioClient = typeof(IAudioClient).GUID;
-                if (source.Activate(ref iidAudioClient, Native.CLSCTX_ALL, IntPtr.Zero, out object clientObj) < 0)
-                    throw new InvalidOperationException("Не удалось открыть основной выход.");
-                audioClient = (IAudioClient)clientObj;
-
-                if (audioClient.GetMixFormat(out mixPtr) < 0 || mixPtr == IntPtr.Zero)
-                    throw new InvalidOperationException("Не удалось получить формат основного выхода.");
-
-                var wf = Marshal.PtrToStructure<WaveFormatEx>(mixPtr);
-                int formatBytes = Marshal.SizeOf<WaveFormatEx>() + wf.cbSize;
-                var formatCopy = new byte[formatBytes];
-                Marshal.Copy(mixPtr, formatCopy, 0, formatBytes);
-
-                evt = Native.CreateEvent(IntPtr.Zero, false, false, null);
-                if (evt == IntPtr.Zero)
-                    throw new InvalidOperationException("Не удалось создать событие WASAPI.");
-
-                var flags = AudioClientStreamFlags.Loopback | AudioClientStreamFlags.EventCallback;
-                int hr = audioClient.Initialize(AudioClientShareMode.Shared, flags, 0, 0, mixPtr, IntPtr.Zero);
-                if (hr < 0) Marshal.ThrowExceptionForHR(hr);
-
-                hr = audioClient.SetEventHandle(evt);
-                if (hr < 0) Marshal.ThrowExceptionForHR(hr);
-
-                var iidCapture = typeof(IAudioCaptureClient).GUID;
-                hr = audioClient.GetService(ref iidCapture, out object capObj);
-                if (hr < 0) Marshal.ThrowExceptionForHR(hr);
-                capture = (IAudioCaptureClient)capObj;
-
-                lock (_renderers)
+                lock (_gate)
                 {
                     foreach (var route in outputs)
                     {
-                        var worker = new RendererWorker(route.DeviceId, route.Mode, formatCopy, wf);
-                        if (!worker.Start(out string rendererError))
-                            throw new InvalidOperationException(rendererError);
-                        _renderers.Add(worker);
+                        var worker = new OutputWorker(enumerator.GetDevice(route.DeviceId), route.Mode, sourceFormat);
+                        worker.Start();
+                        _outputs.Add(worker);
                     }
                 }
 
-                hr = audioClient.Start();
-                if (hr < 0) Marshal.ThrowExceptionForHR(hr);
-
-                while (!_stop)
+                _capture.DataAvailable += (s, e) =>
                 {
-                    if (Native.WaitForSingleObject(evt, 200) != Native.WAIT_OBJECT_0)
-                        continue;
-
-                    while (!_stop)
+                    try
                     {
-                        capture.GetNextPacketSize(out uint next);
-                        if (next == 0) break;
+                        if (!_running || e.BytesRecorded <= 0) return;
+                        var input = new byte[e.BytesRecorded];
+                        Buffer.BlockCopy(e.Buffer, 0, input, 0, e.BytesRecorded);
 
-                        int ghr = capture.GetBuffer(out IntPtr data, out uint frames,
-                            out AudioClientBufferFlags packetFlags, out _, out _);
-                        if (ghr < 0) Marshal.ThrowExceptionForHR(ghr);
-
-                        try
+                        lock (_gate)
                         {
-                            bool silent = (packetFlags & AudioClientBufferFlags.Silent) != 0;
-                            int bytes = checked((int)(frames * wf.nBlockAlign));
-                            byte[] src = new byte[bytes];
-                            if (!silent && data != IntPtr.Zero) Marshal.Copy(data, src, 0, bytes);
-
-                            lock (_renderers)
+                            foreach (var worker in _outputs)
                             {
-                                foreach (var r in _renderers)
-                                    r.Enqueue(RouteAudio(src, frames, wf, sourceMode, r.Mode, silent));
+                                var routed = RouteAudio(input, e.BytesRecorded, sourceFormat, sourceMode, worker.Mode);
+                                worker.AddSamples(routed, routed.Length);
                             }
                         }
-                        finally
-                        {
-                            capture.ReleaseBuffer(frames);
-                        }
                     }
-                }
+                    catch (Exception ex)
+                    {
+                        SetError(ex.Message);
+                    }
+                };
 
-                audioClient.Stop();
+                _capture.RecordingStopped += (s, e) =>
+                {
+                    if (e.Exception != null) SetError(e.Exception.Message);
+                    _running = false;
+                };
+
+                _running = true;
+                _capture.StartRecording();
+                enumerator.Dispose();
+
+                error = "";
+                return true;
             }
             catch (Exception ex)
             {
                 SetError(ex.Message);
-            }
-            finally
-            {
-                lock (_renderers)
-                {
-                    foreach (var r in _renderers) r.Stop();
-                }
-
-                if (evt != IntPtr.Zero) Native.CloseHandle(evt);
-                if (mixPtr != IntPtr.Zero) Marshal.FreeCoTaskMem(mixPtr);
-                if (capture != null) Marshal.ReleaseComObject(capture);
-                if (audioClient != null) Marshal.ReleaseComObject(audioClient);
-                if (source != null) Marshal.ReleaseComObject(source);
-                if (en != null) Marshal.ReleaseComObject(en);
-                _running = false;
+                Stop();
+                error = ex.Message;
+                return false;
             }
         }
 
-        private static byte[] RouteAudio(byte[] src, uint frames, WaveFormatEx wf,
-            ChannelMode sourceMode, ChannelMode outputMode, bool silent)
+        public void Stop()
         {
-            int channels = wf.nChannels;
-            int bits = wf.wBitsPerSample;
-            int bytesPerSample = bits / 8;
-            int frameBytes = wf.nBlockAlign;
-            var output = new byte[checked((int)(frames * wf.nBlockAlign))];
+            _running = false;
 
-            if (silent || src == null || channels <= 0 || bytesPerSample <= 0)
-                return output;
-
-            bool isFloat = wf.wFormatTag == 3 || (wf.wFormatTag == 0xFFFE && bits == 32);
-            bool supported = (bits == 16 || bits == 24 || bits == 32);
-            if (!supported)
+            try
             {
-                Buffer.BlockCopy(src, 0, output, 0, Math.Min(src.Length, output.Length));
-                return output;
-            }
-
-            for (int f = 0; f < frames; f++)
-            {
-                int off = f * frameBytes;
-                float left = ReadSample(src, off, bits, isFloat);
-                float right = channels >= 2 ? ReadSample(src, off + bytesPerSample, bits, isFloat) : left;
-
-                float dl = 0, dr = 0;
-                if (sourceMode == ChannelMode.Left || sourceMode == ChannelMode.Right)
+                if (_capture != null)
                 {
-                    float selected = sourceMode == ChannelMode.Left ? left : right;
-                    if (outputMode == ChannelMode.Stereo) dl = dr = selected;
-                    else if (outputMode == ChannelMode.Left) dl = selected;
-                    else dr = selected;
+                    try { _capture.StopRecording(); } catch { }
+                    _capture.Dispose();
+                    _capture = null;
                 }
-                else
+            }
+            catch { }
+
+            lock (_gate)
+            {
+                foreach (var output in _outputs)
                 {
-                    if (outputMode == ChannelMode.Stereo) { dl = left; dr = right; }
-                    else
-                    {
-                        float mono = (left + right) * 0.5f;
-                        if (outputMode == ChannelMode.Left) dl = mono; else dr = mono;
-                    }
+                    try { output.Dispose(); } catch { }
                 }
-
-                WriteSample(output, off, bits, isFloat, dl);
-                if (channels >= 2) WriteSample(output, off + bytesPerSample, bits, isFloat, dr);
+                _outputs.Clear();
             }
-            return output;
         }
 
-        private static float ReadSample(byte[] b, int o, int bits, bool isFloat)
+        private void SetError(string message)
         {
-            if (bits == 32 && isFloat) return Math.Max(-1f, Math.Min(1f, BitConverter.ToSingle(b, o)));
-            if (bits == 16) return BitConverter.ToInt16(b, o) / 32768f;
-            if (bits == 24)
-            {
-                int v = b[o] | (b[o + 1] << 8) | (b[o + 2] << 16);
-                if ((v & 0x800000) != 0) v |= unchecked((int)0xFF000000);
-                return v / 8388608f;
-            }
-            if (bits == 32) return BitConverter.ToInt32(b, o) / 2147483648f;
-            return 0;
+            lock (_gate) _lastError = message ?? "";
         }
-
-        private static void WriteSample(byte[] b, int o, int bits, bool isFloat, float v)
-        {
-            v = Math.Max(-1f, Math.Min(1f, v));
-            byte[] s;
-            if (bits == 32 && isFloat) s = BitConverter.GetBytes(v);
-            else if (bits == 16) s = BitConverter.GetBytes((short)(v * 32767f));
-            else if (bits == 24)
-            {
-                int n = (int)(v * 8388607f);
-                b[o] = (byte)n; b[o + 1] = (byte)(n >> 8); b[o + 2] = (byte)(n >> 16);
-                return;
-            }
-            else if (bits == 32) s = BitConverter.GetBytes((int)(v * 2147483647f));
-            else return;
-            Buffer.BlockCopy(s, 0, b, o, s.Length);
-        }
-
-        private void SetError(string value) { lock (_errorLock) _lastError = value ?? ""; }
 
         public void Dispose() => Stop();
 
-        private sealed class RendererWorker : IDisposable
+        private static byte[] RouteAudio(byte[] input, int bytesRecorded, WaveFormat format,
+            ChannelMode sourceMode, ChannelMode outputMode)
         {
-            private readonly string _deviceId;
+            int channels = Math.Max(1, format.Channels);
+            int bits = format.BitsPerSample;
+            int bytesPerSample = bits / 8;
+            int blockAlign = format.BlockAlign;
+
+            if (channels < 1 || bytesPerSample <= 0 || blockAlign <= 0 ||
+                (bits != 16 && bits != 24 && bits != 32))
+            {
+                var passthrough = new byte[bytesRecorded];
+                Buffer.BlockCopy(input, 0, passthrough, 0, bytesRecorded);
+                return passthrough;
+            }
+
+            bool isFloat = IsFloat(format);
+            var output = new byte[bytesRecorded];
+            int frames = bytesRecorded / blockAlign;
+
+            for (int frame = 0; frame < frames; frame++)
+            {
+                int offset = frame * blockAlign;
+                float left = ReadSample(input, offset, bits, isFloat);
+                float right = channels >= 2
+                    ? ReadSample(input, offset + bytesPerSample, bits, isFloat)
+                    : left;
+
+                float outLeft = 0f;
+                float outRight = 0f;
+
+                if (sourceMode == ChannelMode.Stereo)
+                {
+                    if (outputMode == ChannelMode.Stereo)
+                    {
+                        outLeft = left;
+                        outRight = right;
+                    }
+                    else
+                    {
+                        float mono = (left + right) * 0.5f;
+                        if (outputMode == ChannelMode.Left) outLeft = mono;
+                        else outRight = mono;
+                    }
+                }
+                else
+                {
+                    float selected = sourceMode == ChannelMode.Left ? left : right;
+                    if (outputMode == ChannelMode.Stereo)
+                    {
+                        outLeft = selected;
+                        outRight = selected;
+                    }
+                    else if (outputMode == ChannelMode.Left)
+                    {
+                        outLeft = selected;
+                    }
+                    else
+                    {
+                        outRight = selected;
+                    }
+                }
+
+                WriteSample(output, offset, bits, isFloat, outLeft);
+                if (channels >= 2)
+                    WriteSample(output, offset + bytesPerSample, bits, isFloat, outRight);
+            }
+
+            return output;
+        }
+
+        private static bool IsFloat(WaveFormat format)
+        {
+            if (format.Encoding == WaveFormatEncoding.IeeeFloat) return true;
+            var extensible = format as WaveFormatExtensible;
+            if (extensible == null) return false;
+            return extensible.SubFormat == new Guid("00000003-0000-0010-8000-00AA00389B71");
+        }
+
+        private static float ReadSample(byte[] data, int offset, int bits, bool isFloat)
+        {
+            if (bits == 32 && isFloat)
+                return Clamp(BitConverter.ToSingle(data, offset));
+
+            if (bits == 16)
+                return BitConverter.ToInt16(data, offset) / 32768f;
+
+            if (bits == 24)
+            {
+                int value = data[offset] | (data[offset + 1] << 8) | (data[offset + 2] << 16);
+                if ((value & 0x800000) != 0) value |= unchecked((int)0xFF000000);
+                return value / 8388608f;
+            }
+
+            if (bits == 32)
+                return BitConverter.ToInt32(data, offset) / 2147483648f;
+
+            return 0f;
+        }
+
+        private static void WriteSample(byte[] data, int offset, int bits, bool isFloat, float value)
+        {
+            value = Clamp(value);
+
+            if (bits == 32 && isFloat)
+            {
+                var bytes = BitConverter.GetBytes(value);
+                Buffer.BlockCopy(bytes, 0, data, offset, 4);
+                return;
+            }
+
+            if (bits == 16)
+            {
+                var bytes = BitConverter.GetBytes((short)(value * 32767f));
+                Buffer.BlockCopy(bytes, 0, data, offset, 2);
+                return;
+            }
+
+            if (bits == 24)
+            {
+                int sample = (int)(value * 8388607f);
+                data[offset] = (byte)sample;
+                data[offset + 1] = (byte)(sample >> 8);
+                data[offset + 2] = (byte)(sample >> 16);
+                return;
+            }
+
+            if (bits == 32)
+            {
+                var bytes = BitConverter.GetBytes((int)(value * 2147483647f));
+                Buffer.BlockCopy(bytes, 0, data, offset, 4);
+            }
+        }
+
+        private static float Clamp(float value)
+        {
+            if (value < -1f) return -1f;
+            if (value > 1f) return 1f;
+            return value;
+        }
+
+        private sealed class OutputWorker : IDisposable
+        {
+            private readonly MMDevice _device;
+            private readonly BufferedWaveProvider _buffer;
+            private readonly MediaFoundationResampler _resampler;
+            private readonly WasapiOut _player;
+
             public ChannelMode Mode { get; }
-            private readonly byte[] _formatBytes;
-            private readonly WaveFormatEx _sourceFormat;
-            private readonly BlockingCollection<byte[]> _queue =
-                new BlockingCollection<byte[]>(new ConcurrentQueue<byte[]>(), 64);
-            private Thread _thread;
-            private volatile bool _stop;
-            private readonly ManualResetEventSlim _init = new ManualResetEventSlim(false);
-            private string _initError = "";
-            private bool _initOk;
 
-            public RendererWorker(string deviceId, ChannelMode mode, byte[] formatBytes, WaveFormatEx sourceFormat)
+            public OutputWorker(MMDevice device, ChannelMode mode, WaveFormat sourceFormat)
             {
-                _deviceId = deviceId;
+                _device = device;
                 Mode = mode;
-                _formatBytes = formatBytes;
-                _sourceFormat = sourceFormat;
-            }
 
-            public bool Start(out string error)
-            {
-                _thread = new Thread(Run) { IsBackground = true, Name = "AudioDuplicate Render" };
-                _thread.Start();
-                _init.Wait();
-                error = _initError;
-                return _initOk;
-            }
-
-            public void Enqueue(byte[] data)
-            {
-                if (_stop || data == null || data.Length == 0) return;
-                while (!_queue.TryAdd(data))
-                    _queue.TryTake(out _);
-            }
-
-            private void Run()
-            {
-                IMMDeviceEnumerator en = null;
-                IMMDevice dev = null;
-                IAudioClient client = null;
-                IAudioRenderClient render = null;
-                IntPtr fmt = IntPtr.Zero;
-                IntPtr evt = IntPtr.Zero;
-
-                try
+                _buffer = new BufferedWaveProvider(sourceFormat)
                 {
-                    en = (IMMDeviceEnumerator)Activator.CreateInstance(
-                        Type.GetTypeFromCLSID(CoreAudioIds.ClsidMmDeviceEnumerator));
-                    if (en.GetDevice(_deviceId, out dev) < 0 || dev == null)
-                        throw new InvalidOperationException("Не удалось открыть дополнительное аудиоустройство.");
+                    DiscardOnBufferOverflow = true,
+                    BufferDuration = TimeSpan.FromMilliseconds(500)
+                };
 
-                    var iidClient = typeof(IAudioClient).GUID;
-                    int hr = dev.Activate(ref iidClient, Native.CLSCTX_ALL, IntPtr.Zero, out object obj);
-                    if (hr < 0) Marshal.ThrowExceptionForHR(hr);
-                    client = (IAudioClient)obj;
-
-                    fmt = Marshal.AllocCoTaskMem(_formatBytes.Length);
-                    Marshal.Copy(_formatBytes, 0, fmt, _formatBytes.Length);
-
-                    evt = Native.CreateEvent(IntPtr.Zero, false, false, null);
-                    if (evt == IntPtr.Zero) throw new InvalidOperationException("Не удалось создать WASAPI event.");
-
-                    var flags = AudioClientStreamFlags.EventCallback |
-                                AudioClientStreamFlags.AutoConvertPcm |
-                                AudioClientStreamFlags.SrcDefaultQuality;
-
-                    hr = client.Initialize(AudioClientShareMode.Shared, flags, 0, 0, fmt, IntPtr.Zero);
-                    if (hr < 0) Marshal.ThrowExceptionForHR(hr);
-
-                    hr = client.SetEventHandle(evt);
-                    if (hr < 0) Marshal.ThrowExceptionForHR(hr);
-
-                    client.GetBufferSize(out uint bufferFrames);
-                    var iidRender = typeof(IAudioRenderClient).GUID;
-                    hr = client.GetService(ref iidRender, out object renderObj);
-                    if (hr < 0) Marshal.ThrowExceptionForHR(hr);
-                    render = (IAudioRenderClient)renderObj;
-
-                    hr = client.Start();
-                    if (hr < 0) Marshal.ThrowExceptionForHR(hr);
-
-                    _initOk = true;
-                    _init.Set();
-
-                    byte[] pending = null;
-                    int offset = 0;
-                    int frameBytes = _sourceFormat.nBlockAlign;
-
-                    while (!_stop)
-                    {
-                        if (Native.WaitForSingleObject(evt, 200) != Native.WAIT_OBJECT_0)
-                            continue;
-
-                        if (client.GetCurrentPadding(out uint padding) < 0) continue;
-                        uint available = bufferFrames > padding ? bufferFrames - padding : 0;
-                        if (available == 0) continue;
-
-                        if (render.GetBuffer(available, out IntPtr dst) < 0) continue;
-                        int need = checked((int)(available * frameBytes));
-                        var outBuf = new byte[need];
-                        int written = 0;
-
-                        while (written < need)
-                        {
-                            if (pending == null || offset >= pending.Length)
-                            {
-                                if (!_queue.TryTake(out pending)) break;
-                                offset = 0;
-                            }
-
-                            int n = Math.Min(need - written, pending.Length - offset);
-                            Buffer.BlockCopy(pending, offset, outBuf, written, n);
-                            written += n;
-                            offset += n;
-                        }
-
-                        Marshal.Copy(outBuf, 0, dst, outBuf.Length);
-                        render.ReleaseBuffer(available, AudioClientBufferFlags.None);
-                    }
-
-                    client.Stop();
-                }
-                catch (Exception ex)
+                var targetFormat = _device.AudioClient.MixFormat;
+                _resampler = new MediaFoundationResampler(_buffer, targetFormat)
                 {
-                    if (!_init.IsSet)
-                    {
-                        _initError = ex.Message;
-                        _initOk = false;
-                        _init.Set();
-                    }
-                }
-                finally
-                {
-                    if (!_init.IsSet) _init.Set();
-                    if (evt != IntPtr.Zero) Native.CloseHandle(evt);
-                    if (fmt != IntPtr.Zero) Marshal.FreeCoTaskMem(fmt);
-                    if (render != null) Marshal.ReleaseComObject(render);
-                    if (client != null) Marshal.ReleaseComObject(client);
-                    if (dev != null) Marshal.ReleaseComObject(dev);
-                    if (en != null) Marshal.ReleaseComObject(en);
-                }
+                    ResamplerQuality = 60
+                };
+
+                _player = new WasapiOut(_device, AudioClientShareMode.Shared, true, 80);
+                _player.Init(_resampler);
             }
 
-            public void Stop()
+            public void Start() => _player.Play();
+
+            public void AddSamples(byte[] data, int count)
             {
-                _stop = true;
-                if (_thread != null && _thread.IsAlive) _thread.Join(1500);
+                _buffer.AddSamples(data, 0, count);
             }
 
             public void Dispose()
             {
-                Stop();
-                _queue.Dispose();
-                _init.Dispose();
+                try { _player.Stop(); } catch { }
+                _player.Dispose();
+                _resampler.Dispose();
+                _device.Dispose();
             }
         }
     }
