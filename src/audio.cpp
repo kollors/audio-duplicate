@@ -500,38 +500,37 @@ private:
             return;
         }
 
-        WAVEFORMATEX* format = nullptr;
-        hr = client->GetMixFormat(&format);
-        if (FAILED(hr) || !format) {
-            Fail(L"Unable to get output format", hr);
-            return;
-        }
-        auto freeFormat = [&]() {
-            if (format) {
-                CoTaskMemFree(format);
-                format = nullptr;
-            }
-        };
-
-        if (!IsSupportedMixFormat(format)) {
-            freeFormat();
-            if (errorCallback_) errorCallback_(L"Output device uses an unsupported audio format.");
-            return;
-        }
+        // Use one predictable client format for every output. In shared mode,
+        // Windows Audio Engine converts this stream to each endpoint's native
+        // mix format (sample rate, PCM container and channel matrix).
+        WAVEFORMATEX streamFormat{};
+        streamFormat.wFormatTag = WAVE_FORMAT_IEEE_FLOAT;
+        streamFormat.nChannels = 2;
+        streamFormat.nSamplesPerSec = sourceRate_;
+        streamFormat.wBitsPerSample = 32;
+        streamFormat.nBlockAlign =
+            static_cast<WORD>(streamFormat.nChannels * streamFormat.wBitsPerSample / 8);
+        streamFormat.nAvgBytesPerSec =
+            streamFormat.nSamplesPerSec * streamFormat.nBlockAlign;
+        streamFormat.cbSize = 0;
 
         HANDLE eventHandle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         if (!eventHandle) {
-            freeFormat();
             if (errorCallback_) errorCallback_(L"Unable to create the output audio event.");
             return;
         }
 
+        const DWORD streamFlags =
+            AUDCLNT_STREAMFLAGS_EVENTCALLBACK |
+            AUDCLNT_STREAMFLAGS_NOPERSIST |
+            AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
+            AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+
         hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED,
-                                AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_NOPERSIST,
-                                0, 0, format, nullptr);
+                                streamFlags,
+                                0, 0, &streamFormat, nullptr);
         if (FAILED(hr)) {
             CloseHandle(eventHandle);
-            freeFormat();
             Fail(L"Unable to initialize output WASAPI", hr);
             return;
         }
@@ -539,50 +538,52 @@ private:
         hr = client->SetEventHandle(eventHandle);
         if (FAILED(hr)) {
             CloseHandle(eventHandle);
-            freeFormat();
             Fail(L"Unable to configure output WASAPI event", hr);
             return;
         }
 
         UINT32 bufferFrames = 0;
         hr = client->GetBufferSize(&bufferFrames);
-        if (FAILED(hr)) {
+        if (FAILED(hr) || bufferFrames == 0) {
             CloseHandle(eventHandle);
-            freeFormat();
-            Fail(L"Unable to query output buffer", hr);
+            Fail(L"Unable to query output buffer", FAILED(hr) ? hr : E_FAIL);
             return;
         }
 
         ComPtr<IAudioRenderClient> render;
-        hr = client->GetService(__uuidof(IAudioRenderClient), reinterpret_cast<void**>(render.Put()));
+        hr = client->GetService(__uuidof(IAudioRenderClient),
+                                reinterpret_cast<void**>(render.Put()));
         if (FAILED(hr)) {
             CloseHandle(eventHandle);
-            freeFormat();
             Fail(L"Unable to get WASAPI render service", hr);
             return;
         }
 
+        // Prime the render endpoint with silence before Start().
         BYTE* initial = nullptr;
-        if (SUCCEEDED(render->GetBuffer(bufferFrames, &initial))) {
+        hr = render->GetBuffer(bufferFrames, &initial);
+        if (SUCCEEDED(hr)) {
             render->ReleaseBuffer(bufferFrames, AUDCLNT_BUFFERFLAGS_SILENT);
         }
 
         hr = client->Start();
         if (FAILED(hr)) {
             CloseHandle(eventHandle);
-            freeFormat();
             Fail(L"Unable to start output device", hr);
             return;
         }
 
-        const uint32_t targetRate = format->nSamplesPerSec;
-        const size_t targetFill = std::max<size_t>(static_cast<size_t>(sourceRate_) * 12 / 1000, 64);
-        const size_t startupFill = std::max<size_t>(static_cast<size_t>(sourceRate_) * 4 / 1000, 32);
-        const double baseRatio = static_cast<double>(sourceRate_) / static_cast<double>(targetRate);
+        // All output clients now consume the same nominal sample rate.
+        // A tiny adaptive ratio still absorbs independent hardware-clock drift.
+        const size_t targetFill =
+            std::max<size_t>(static_cast<size_t>(sourceRate_) * 16 / 1000, 96);
+        const size_t startupFill =
+            std::max<size_t>(static_cast<size_t>(sourceRate_) * 8 / 1000, 48);
+        constexpr double baseRatio = 1.0;
         std::vector<float> stereo;
 
         while (!stop_.load()) {
-            const DWORD wait = WaitForSingleObject(eventHandle, 100);
+            const DWORD wait = WaitForSingleObject(eventHandle, 50);
             if (wait != WAIT_OBJECT_0 && wait != WAIT_TIMEOUT) continue;
             if (stop_.load()) break;
 
@@ -595,41 +596,40 @@ private:
             if (padding >= bufferFrames) continue;
 
             const UINT32 framesToWrite = bufferFrames - padding;
-            BYTE* buffer = nullptr;
-            hr = render->GetBuffer(framesToWrite, &buffer);
+            if (framesToWrite == 0) continue;
+
+            BYTE* rawBuffer = nullptr;
+            hr = render->GetBuffer(framesToWrite, &rawBuffer);
             if (FAILED(hr)) {
                 Fail(L"Unable to access output audio buffer", hr);
                 break;
             }
 
-            std::memset(buffer, 0, static_cast<size_t>(framesToWrite) * format->nBlockAlign);
+            auto* buffer = reinterpret_cast<float*>(rawBuffer);
+            std::fill(buffer, buffer + static_cast<size_t>(framesToWrite) * 2, 0.0f);
+
             stereo.assign(static_cast<size_t>(framesToWrite) * 2, 0.0f);
-            const size_t produced = ring_.PopResampled(stereo.data(), framesToWrite, baseRatio,
-                                                       targetFill, startupFill);
+            const size_t produced =
+                ring_.PopResampled(stereo.data(), framesToWrite, baseRatio,
+                                   targetFill, startupFill);
 
             for (size_t i = 0; i < produced; ++i) {
                 const float left = stereo[i * 2];
                 const float right = stereo[i * 2 + 1];
                 const float mono = (left + right) * 0.5f;
-                BYTE* frame = buffer + i * format->nBlockAlign;
-
-                if (format->nChannels == 1) {
-                    WriteSample(frame, 0, format, mono);
-                    continue;
-                }
 
                 switch (mode_) {
                     case ChannelMode::Stereo:
-                        WriteSample(frame, 0, format, left);
-                        WriteSample(frame, 1, format, right);
+                        buffer[i * 2] = left;
+                        buffer[i * 2 + 1] = right;
                         break;
                     case ChannelMode::Left:
-                        WriteSample(frame, 0, format, mono);
-                        WriteSample(frame, 1, format, 0.0f);
+                        buffer[i * 2] = mono;
+                        buffer[i * 2 + 1] = 0.0f;
                         break;
                     case ChannelMode::Right:
-                        WriteSample(frame, 0, format, 0.0f);
-                        WriteSample(frame, 1, format, mono);
+                        buffer[i * 2] = 0.0f;
+                        buffer[i * 2 + 1] = mono;
                         break;
                 }
             }
@@ -643,7 +643,6 @@ private:
 
         client->Stop();
         CloseHandle(eventHandle);
-        freeFormat();
     }
 
     std::wstring deviceId_;
@@ -839,7 +838,7 @@ void AudioEngine::CaptureThreadMain(std::wstring sourceDeviceId, ChannelMode sou
 
     std::vector<float> stereo;
     while (!stop_.load()) {
-        const DWORD wait = WaitForSingleObject(eventHandle, 100);
+        const DWORD wait = WaitForSingleObject(eventHandle, 20);
         if (wait != WAIT_OBJECT_0 && wait != WAIT_TIMEOUT) continue;
         if (stop_.load()) break;
 
