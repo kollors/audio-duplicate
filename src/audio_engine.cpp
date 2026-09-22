@@ -179,60 +179,59 @@ ComPtr<IMMDevice> FindDeviceById(const std::wstring& id) {
 struct AudioEngine::Renderer {
     std::wstring deviceId;
     ChannelMode mode = ChannelMode::Stereo;
-    ComPtr<IAudioClient> client;
-    ComPtr<IAudioRenderClient> render;
-    HANDLE eventHandle = nullptr;
+
     std::thread thread;
     std::atomic<bool> stop{false};
+
     std::mutex queueMutex;
     std::deque<std::vector<uint8_t>> queue;
     size_t queuedBytes = 0;
+
+    std::mutex initMutex;
+    std::condition_variable initCv;
+    bool initDone = false;
+    bool initOk = false;
+    std::wstring initError;
+
+    std::vector<uint8_t> formatBytes;
     UINT32 frameBytes = 0;
-    UINT32 bufferFrames = 0;
 
     ~Renderer() { Shutdown(); }
 
     bool Init(const WAVEFORMATEX* sourceFormat, std::wstring& error) {
-        auto dev = FindDeviceById(deviceId);
-        if (!dev) { error = L"Не удалось открыть дополнительное аудиоустройство."; return false; }
+        if (!sourceFormat) {
+            error = L"Некорректный формат основного аудиоустройства.";
+            return false;
+        }
 
-        HRESULT hr = dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, &client);
-        if (FAILED(hr)) { error = HrText(L"IAudioClient::Activate", hr); return false; }
-
-        eventHandle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        if (!eventHandle) { error = L"Не удалось создать WASAPI event."; return false; }
-
-        DWORD flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK |
-                      AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
-                      AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
-
-        // Ask the shared-mode engine to accept the capture format. Windows Audio Engine
-        // converts it to the endpoint's mix format when necessary.
-        hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 0, 0, sourceFormat, nullptr);
-        if (FAILED(hr)) { error = HrText(L"Не удалось открыть дополнительный выход", hr); return false; }
-
-        hr = client->SetEventHandle(eventHandle);
-        if (FAILED(hr)) { error = HrText(L"IAudioClient::SetEventHandle", hr); return false; }
-
-        hr = client->GetBufferSize(&bufferFrames);
-        if (FAILED(hr)) { error = HrText(L"IAudioClient::GetBufferSize", hr); return false; }
-
-        hr = client->GetService(IID_PPV_ARGS(&render));
-        if (FAILED(hr)) { error = HrText(L"IAudioClient::GetService(render)", hr); return false; }
-
+        const size_t formatSize = sizeof(WAVEFORMATEX) + sourceFormat->cbSize;
+        formatBytes.resize(formatSize);
+        std::memcpy(formatBytes.data(), sourceFormat, formatSize);
         frameBytes = sourceFormat->nBlockAlign;
-        hr = client->Start();
-        if (FAILED(hr)) { error = HrText(L"IAudioClient::Start(render)", hr); return false; }
 
         thread = std::thread([this] { Run(); });
+
+        std::unique_lock lock(initMutex);
+        initCv.wait(lock, [this] { return initDone; });
+        if (!initOk) {
+            error = initError;
+            lock.unlock();
+            Shutdown();
+            return false;
+        }
         return true;
     }
 
     void Push(std::vector<uint8_t> data) {
         if (data.empty() || stop.load()) return;
         std::scoped_lock lock(queueMutex);
-        // Bound latency. Keep roughly <= 500 ms assuming usual audio rates.
-        const size_t hardLimit = static_cast<size_t>(frameBytes) * 48000 / 2;
+
+        const auto* format = reinterpret_cast<const WAVEFORMATEX*>(formatBytes.data());
+        const size_t bytesPerSecond = format && format->nAvgBytesPerSec
+            ? static_cast<size_t>(format->nAvgBytesPerSec)
+            : static_cast<size_t>(frameBytes) * 48000;
+        const size_t hardLimit = std::max<size_t>(bytesPerSecond / 2, frameBytes * 256);
+
         while (!queue.empty() && queuedBytes + data.size() > hardLimit) {
             queuedBytes -= queue.front().size();
             queue.pop_front();
@@ -241,11 +240,106 @@ struct AudioEngine::Renderer {
         queue.push_back(std::move(data));
     }
 
+    void SignalInit(bool ok, std::wstring error = {}) {
+        {
+            std::scoped_lock lock(initMutex);
+            initOk = ok;
+            initError = std::move(error);
+            initDone = true;
+        }
+        initCv.notify_one();
+    }
+
     void Run() {
         const HRESULT comInit = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         const bool uninitCom = SUCCEEDED(comInit);
+        if (FAILED(comInit) && comInit != RPC_E_CHANGED_MODE) {
+            SignalInit(false, HrText(L"COM initialization failed", comInit));
+            return;
+        }
+
         DWORD taskIndex = 0;
         HANDLE mmcss = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
+
+        ComPtr<IMMDevice> dev = FindDeviceById(deviceId);
+        if (!dev) {
+            SignalInit(false, L"Не удалось открыть дополнительное аудиоустройство.");
+            if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
+            if (uninitCom) CoUninitialize();
+            return;
+        }
+
+        ComPtr<IAudioClient> client;
+        HRESULT hr = dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, &client);
+        if (FAILED(hr)) {
+            SignalInit(false, HrText(L"IAudioClient::Activate", hr));
+            if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
+            if (uninitCom) CoUninitialize();
+            return;
+        }
+
+        HANDLE eventHandle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!eventHandle) {
+            SignalInit(false, L"Не удалось создать WASAPI event.");
+            if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
+            if (uninitCom) CoUninitialize();
+            return;
+        }
+
+        const auto* sourceFormat = reinterpret_cast<const WAVEFORMATEX*>(formatBytes.data());
+        DWORD flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK |
+                      AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
+                      AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+
+        hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 0, 0, sourceFormat, nullptr);
+        if (FAILED(hr)) {
+            CloseHandle(eventHandle);
+            SignalInit(false, HrText(L"Не удалось открыть дополнительный выход", hr));
+            if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
+            if (uninitCom) CoUninitialize();
+            return;
+        }
+
+        hr = client->SetEventHandle(eventHandle);
+        if (FAILED(hr)) {
+            CloseHandle(eventHandle);
+            SignalInit(false, HrText(L"IAudioClient::SetEventHandle", hr));
+            if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
+            if (uninitCom) CoUninitialize();
+            return;
+        }
+
+        UINT32 bufferFrames = 0;
+        hr = client->GetBufferSize(&bufferFrames);
+        if (FAILED(hr)) {
+            CloseHandle(eventHandle);
+            SignalInit(false, HrText(L"IAudioClient::GetBufferSize", hr));
+            if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
+            if (uninitCom) CoUninitialize();
+            return;
+        }
+
+        ComPtr<IAudioRenderClient> render;
+        hr = client->GetService(IID_PPV_ARGS(&render));
+        if (FAILED(hr)) {
+            CloseHandle(eventHandle);
+            SignalInit(false, HrText(L"IAudioClient::GetService(render)", hr));
+            if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
+            if (uninitCom) CoUninitialize();
+            return;
+        }
+
+        hr = client->Start();
+        if (FAILED(hr)) {
+            CloseHandle(eventHandle);
+            SignalInit(false, HrText(L"IAudioClient::Start(render)", hr));
+            if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
+            if (uninitCom) CoUninitialize();
+            return;
+        }
+
+        SignalInit(true);
+
         std::vector<uint8_t> pending;
         size_t offset = 0;
 
@@ -254,12 +348,15 @@ struct AudioEngine::Renderer {
             if (wr != WAIT_OBJECT_0) continue;
 
             UINT32 padding = 0;
-            if (FAILED(client->GetCurrentPadding(&padding))) continue;
-            UINT32 available = bufferFrames > padding ? bufferFrames - padding : 0;
+            hr = client->GetCurrentPadding(&padding);
+            if (FAILED(hr)) continue;
+
+            const UINT32 available = bufferFrames > padding ? bufferFrames - padding : 0;
             if (!available) continue;
 
             BYTE* dst = nullptr;
-            if (FAILED(render->GetBuffer(available, &dst))) continue;
+            hr = render->GetBuffer(available, &dst);
+            if (FAILED(hr)) continue;
 
             const size_t need = static_cast<size_t>(available) * frameBytes;
             size_t written = 0;
@@ -272,14 +369,21 @@ struct AudioEngine::Renderer {
                     queuedBytes -= pending.size();
                     offset = 0;
                 }
+
                 const size_t chunk = std::min(need - written, pending.size() - offset);
                 std::memcpy(dst + written, pending.data() + offset, chunk);
                 written += chunk;
                 offset += chunk;
             }
+
             if (written < need) std::memset(dst + written, 0, need - written);
             render->ReleaseBuffer(available, 0);
         }
+
+        client->Stop();
+        render.Reset();
+        client.Reset();
+        CloseHandle(eventHandle);
 
         if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
         if (uninitCom) CoUninitialize();
@@ -287,15 +391,7 @@ struct AudioEngine::Renderer {
 
     void Shutdown() {
         stop.store(true);
-        if (eventHandle) SetEvent(eventHandle);
         if (thread.joinable()) thread.join();
-        if (client) client->Stop();
-        render.Reset();
-        client.Reset();
-        if (eventHandle) {
-            CloseHandle(eventHandle);
-            eventHandle = nullptr;
-        }
     }
 };
 
