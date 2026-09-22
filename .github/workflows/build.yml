@@ -1,4 +1,4 @@
-name: Build Windows EXE
+name: Build Windows Portable
 
 on:
   workflow_dispatch:
@@ -26,15 +26,42 @@ jobs:
       - name: Build
         run: msbuild AudioDuplicate.csproj /p:Configuration=Release /p:Platform=x64 /m
 
-      - name: Prepare artifact
+      - name: Prepare portable folder
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path artifact | Out-Null
-          Copy-Item "bin/x64/Release/net48/AudioDuplicate.exe" "artifact/AudioDuplicate.exe"
+          New-Item -ItemType Directory -Force -Path portable | Out-Null
+          Copy-Item "bin/x64/Release/net48/AudioDuplicate.exe" portable/
+          Copy-Item "bin/x64/Release/net48/*.dll" portable/
+          if (Test-Path "bin/x64/Release/net48/AudioDuplicate.exe.config") {
+            Copy-Item "bin/x64/Release/net48/AudioDuplicate.exe.config" portable/
+          }
 
-      - name: Upload EXE
+      - name: Microsoft Defender scan
+        shell: pwsh
+        run: |
+          $portable = (Resolve-Path "portable").Path
+          $mp = Join-Path $env:ProgramFiles "Windows Defender\MpCmdRun.exe"
+          if (-not (Test-Path $mp)) {
+            $candidate = Get-ChildItem "$env:ProgramData\Microsoft\Windows Defender\Platform\*\MpCmdRun.exe" -ErrorAction SilentlyContinue |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1
+            if ($candidate) { $mp = $candidate.FullName }
+          }
+          if (-not (Test-Path $mp)) {
+            throw "Microsoft Defender scanner is unavailable on this runner."
+          }
+          & $mp -Scan -ScanType 3 -File $portable -DisableRemediation
+          if ($LASTEXITCODE -ne 0) {
+            throw "Microsoft Defender scan failed or detected a threat. Exit code: $LASTEXITCODE"
+          }
+
+      - name: Create ZIP
+        shell: pwsh
+        run: Compress-Archive -Path "portable/*" -DestinationPath "AudioDuplicate-portable.zip" -Force
+
+      - name: Upload portable build
         uses: actions/upload-artifact@v4
         with:
-          name: AudioDuplicate-Windows-x64
-          path: artifact/AudioDuplicate.exe
+          name: AudioDuplicate-Windows-x64-portable
+          path: AudioDuplicate-portable.zip
           if-no-files-found: error
