@@ -182,7 +182,9 @@ void LayoutRows() {
 
     for (size_t i = 0; i < gApp.rows.size(); ++i) {
         int y = static_cast<int>(i) * kRowHeight - gApp.scrollPos + 4;
-        MoveWindow(gApp.rows[i].device, margin, y, deviceW, 34, TRUE);
+        // CBS_DROPDOWNLIST uses the window height for the drop-down list as well.
+        // A height of 34px makes the list effectively one item tall.
+        MoveWindow(gApp.rows[i].device, margin, y, deviceW, 240, TRUE);
         MoveWindow(gApp.rows[i].mode, margin + deviceW + gap, y, modeW, 180, TRUE);
         MoveWindow(gApp.rows[i].remove, margin + deviceW + gap + modeW + gap, y, buttonW, 34, TRUE);
     }
@@ -194,7 +196,14 @@ void AddRow(const OutputRoute* initial = nullptr) {
     row.device = MakeControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL, 0, 0, 200, 300, gApp.pane);
     row.mode = MakeControl(WC_COMBOBOXW, L"", CBS_DROPDOWNLIST | WS_VSCROLL, 0, 0, 120, 200, gApp.pane);
     row.remove = MakeControl(L"BUTTON", L"−", BS_PUSHBUTTON, 0, 0, 36, 34, gApp.pane);
-    FillDeviceCombo(row.device, initial ? initial->deviceId : L"");
+    std::wstring initialDevice = initial ? initial->deviceId : L"";
+    if (!initial && initialDevice.empty()) {
+        const std::wstring sourceId = ComboDeviceId(gApp.sourceDevice);
+        auto it = std::find_if(gApp.devices.begin(), gApp.devices.end(),
+                               [&](const AudioDevice& d) { return d.id != sourceId; });
+        if (it != gApp.devices.end()) initialDevice = it->id;
+    }
+    FillDeviceCombo(row.device, initialDevice);
     FillModeCombo(row.mode, initial ? initial->mode : ChannelMode::Stereo);
     gApp.rows.push_back(row);
     LayoutRows();
@@ -334,7 +343,7 @@ void OpenSettings() {
     if (existing) { SetForegroundWindow(existing); return; }
     RECT rc{}; GetWindowRect(gApp.hwnd, &rc);
     CreateWindowExW(WS_EX_DLGMODALFRAME, kSettingsClass, Tr(L"Настройки", L"Settings"),
-                    WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+                    WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
                     rc.left + 80, rc.top + 80, 420, 300,
                     gApp.hwnd, nullptr, GetModuleHandleW(nullptr), nullptr);
 }
@@ -367,6 +376,9 @@ LRESULT CALLBACK PaneProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_SIZE:
         LayoutRows(); return 0;
+    case WM_COMMAND:
+        // Controls in the scroll pane notify the pane, not the main window.
+        return SendMessageW(GetParent(hwnd), WM_COMMAND, wp, lp);
     case WM_CTLCOLORSTATIC:
     case WM_CTLCOLORBTN: {
         HDC dc = reinterpret_cast<HDC>(wp);
