@@ -85,7 +85,7 @@ namespace AudioDuplicate
                 }
                 else
                 {
-                    var err = _engine.LastError;
+                    var err = _engine.ConsumeLastError();
                     if (!string.IsNullOrWhiteSpace(err) && _start.Enabled)
                     {
                         UpdateRunState();
@@ -238,6 +238,7 @@ namespace AudioDuplicate
                 routes,
                 out string error))
             {
+                _engine.ConsumeLastError();
                 MessageBox.Show(this, error, "Audio Duplicate", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return;
             }
