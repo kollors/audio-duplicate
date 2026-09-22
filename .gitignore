@@ -1,0 +1,5 @@
+build/
+AudioDuplicate.exe
+AudioDuplicate.cfg
+.vs/
+out/
