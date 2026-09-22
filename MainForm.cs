@@ -76,7 +76,7 @@ namespace AudioDuplicate
                 SaveCurrentSettings();
             };
 
-            _timer.Interval = 3000;
+            _timer.Interval = 500;
             _timer.Tick += (_, __) =>
             {
                 if (_engine.IsRunning)
@@ -261,9 +261,27 @@ namespace AudioDuplicate
                 r.Remove.Enabled = !running;
             }
 
-            _status.Text = running
-                ? (_settings.Language == "en" ? "●  Running" : "●  Работает")
-                : (_settings.Language == "en" ? "●  Ready" : "●  Готов к работе");
+            if (running)
+            {
+                if (_engine.HasCapturedAudio)
+                {
+                    _status.Text = _settings.Language == "en"
+                        ? "●  Audio is being duplicated"
+                        : "●  Звук дублируется";
+                }
+                else
+                {
+                    _status.Text = _settings.Language == "en"
+                        ? "●  Waiting for audio from main output"
+                        : "●  Ожидание звука с основного выхода";
+                }
+            }
+            else
+            {
+                _status.Text = _settings.Language == "en"
+                    ? "●  Ready"
+                    : "●  Готов к работе";
+            }
             _start.Text = running
                 ? (_settings.Language == "en" ? "Stop" : "Остановить")
                 : (_settings.Language == "en" ? "Start" : "Запустить");
