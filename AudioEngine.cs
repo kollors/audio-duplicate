@@ -430,10 +430,11 @@ namespace AudioDuplicate
                     _originalMute = false;
                 }
 
-                _buffer = new BufferedWaveProvider(sourceFormat)
+                _buffer = new BufferedWaveProvider(
+                    sourceFormat,
+                    TimeSpan.FromMilliseconds(120))
                 {
-                    DiscardOnBufferOverflow = true,
-                    BufferDuration = TimeSpan.FromMilliseconds(120)
+                    DiscardOnBufferOverflow = true
                 };
 
                 _player = new WasapiPlayerBuilder()
