@@ -19,6 +19,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
       - name: Read version
         id: version
         shell: pwsh
@@ -30,17 +33,17 @@ jobs:
           "version=$version" >> $env:GITHUB_OUTPUT
           "tag=v$version" >> $env:GITHUB_OUTPUT
 
-      - name: Configure
-        run: cmake -S . -B build -A x64
+      - name: Restore
+        run: msbuild AudioDuplicate.csproj /t:Restore /p:RestoreIgnoreFailedSources=true
 
       - name: Build
-        run: cmake --build build --config Release
+        run: msbuild AudioDuplicate.csproj /p:Configuration=Release /p:Platform=x64 /m
 
       - name: Prepare release asset
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path release | Out-Null
-          Copy-Item "build/Release/AudioDuplicate.exe" "release/AudioDuplicate.exe"
+          Copy-Item "bin/x64/Release/net48/AudioDuplicate.exe" "release/AudioDuplicate.exe"
 
       - name: Publish GitHub Release
         shell: pwsh
