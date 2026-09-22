@@ -17,24 +17,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup MSBuild
-        uses: microsoft/setup-msbuild@v2
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
 
       - name: Restore
-        run: msbuild AudioDuplicate.csproj /t:Restore /p:RestoreIgnoreFailedSources=true
+        run: dotnet restore AudioDuplicate.csproj
 
-      - name: Build
-        run: msbuild AudioDuplicate.csproj /p:Configuration=Release /p:Platform=x64 /m
-
-      - name: Prepare portable folder
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path portable | Out-Null
-          Copy-Item "bin/x64/Release/net48/AudioDuplicate.exe" portable/
-          Copy-Item "bin/x64/Release/net48/*.dll" portable/
-          if (Test-Path "bin/x64/Release/net48/AudioDuplicate.exe.config") {
-            Copy-Item "bin/x64/Release/net48/AudioDuplicate.exe.config" portable/
-          }
+      - name: Publish
+        run: dotnet publish AudioDuplicate.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=false -o portable
 
       - name: Microsoft Defender scan
         shell: pwsh
