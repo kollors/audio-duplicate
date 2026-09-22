@@ -1,58 +1,41 @@
 # Audio Duplicate
 
-Portable Windows utility that captures the audio currently playing on one render endpoint using WASAPI Loopback and mirrors it to any number of additional render endpoints.
+Portable Windows utility for duplicating the audio playing on one output device to one or more additional output devices.
 
-## Implemented UI
+## Features
 
-- Main output selector.
-- Per-main-output channel mode: Stereo / Left / Right.
-- Dynamic list of **Additional outputs**.
-- `+` adds another output; `−` removes that row.
-- Per-output channel mode: Stereo / Left / Right.
-- Scrollbar appears when the additional-output list no longer fits.
-- Global refresh button next to Settings refreshes every device selector.
-- Settings:
-  - auto-refresh device list;
-  - save settings beside EXE;
-  - Russian / English.
+- WASAPI Loopback capture from the selected main output.
+- Any number of additional outputs.
+- Per-device channel routing: Stereo / Left / Right.
+- Scrollable list of additional outputs.
+- Global device refresh button.
+- Russian and English UI.
+- Optional settings file stored only beside `AudioDuplicate.exe`.
+- No installer, service, driver, virtual audio device, registry settings, network access, telemetry, or autostart.
 
-## Channel routing
+## Portable behavior
 
-- Main Stereo -> Output Stereo: L->L, R->R.
-- Main Left -> Output Stereo: source L is duplicated to L+R.
-- Main Right -> Output Stereo: source R is duplicated to L+R.
-- Main Left -> Output Right: source L goes only to output R.
-- Main Right -> Output Left: source R goes only to output L.
-- Main Stereo -> Output Left/Right: L+R is mixed to mono and placed only on the selected output channel.
-
-## Portability
-
-The application itself:
-
-- does not install drivers or services;
-- does not create virtual audio devices;
-- does not write its own settings to the Registry, AppData, ProgramData or Temp;
-- writes `AudioDuplicate.ini` only beside the executable when **Save settings beside EXE** is enabled;
-- deletes that INI when saving is disabled.
-
-Windows, the audio service and GPU/audio drivers may maintain their own normal operating-system state independently of this application.
-
-## Audio implementation
-
-- Main endpoint: WASAPI Loopback, shared mode.
-- Additional endpoints: WASAPI shared render streams.
-- `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM` and `AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY` let the Windows Audio Engine convert the source format to each output endpoint's mix format.
-- Each additional endpoint has its own render worker and bounded queue.
-- Audio workers opt into MMCSS `Pro Audio` scheduling.
+The application does not require installation. If **Save settings beside EXE** is disabled, Audio Duplicate does not create its own persistent files. If enabled, it creates only `AudioDuplicate.ini` in the same directory as the executable.
 
 ## Build
 
-Requires Visual Studio 2022 Build Tools or Visual Studio with **Desktop development with C++** and Windows 10/11 SDK.
+Requirements:
 
-From a Developer Command Prompt:
+- Windows
+- Visual Studio 2022 / Build Tools with .NET Framework 4.8 targeting pack
+- MSBuild
 
-```bat
-build.bat
+Build:
+
+```powershell
+msbuild AudioDuplicate.csproj /t:Restore
+msbuild AudioDuplicate.csproj /p:Configuration=Release /p:Platform=x64 /m
 ```
 
-The executable is created under `build\\Release\\AudioDuplicate.exe`.
+Output:
+
+```
+bin/x64/Release/net48/AudioDuplicate.exe
+```
+
+Releases are built on GitHub Actions from the public source tree.
