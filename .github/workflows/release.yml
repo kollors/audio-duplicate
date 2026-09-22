@@ -18,12 +18,23 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Reconstruct v0.1.2 source
+        shell: pwsh
+        run: |
+          $parts = Get-ChildItem ".release-src/part-*.txt" | Sort-Object Name
+          if ($parts.Count -eq 0) { throw "Release source parts not found" }
+          $base64 = ($parts | ForEach-Object { Get-Content $_.FullName -Raw }) -join ""
+          [IO.File]::WriteAllBytes("source.zip", [Convert]::FromBase64String($base64))
+          Expand-Archive "source.zip" -DestinationPath "stage" -Force
 
       - name: Read version
         id: version
         shell: pwsh
         run: |
-          $version = (Get-Content VERSION -Raw).Trim()
+          $version = (Get-Content "stage/audio-duplicate/VERSION" -Raw).Trim()
           if ($version -notmatch '^\d+\.\d+\.\d+([-.][0-9A-Za-z.-]+)?$') {
             throw "Invalid VERSION: $version"
           }
@@ -31,7 +42,7 @@ jobs:
           "tag=v$version" >> $env:GITHUB_OUTPUT
 
       - name: Configure
-        run: cmake -S . -B build -A x64
+        run: cmake -S stage/audio-duplicate -B build -A x64
 
       - name: Build
         run: cmake --build build --config Release
@@ -42,12 +53,38 @@ jobs:
           New-Item -ItemType Directory -Force -Path release | Out-Null
           Copy-Item "build/Release/AudioDuplicate.exe" "release/AudioDuplicate.exe"
 
+      - name: Publish source to main
+        id: source_commit
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          Remove-Item -Recurse -Force src -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force res -ErrorAction SilentlyContinue
+          Remove-Item -Force CMakeLists.txt, README.md, build.bat, build_release.bat -ErrorAction SilentlyContinue
+          Copy-Item "stage/audio-duplicate/src" "src" -Recurse
+          Copy-Item "stage/audio-duplicate/CMakeLists.txt" "."
+          Copy-Item "stage/audio-duplicate/README.md" "."
+          Copy-Item "stage/audio-duplicate/build.bat" "."
+          Copy-Item "stage/audio-duplicate/VERSION" "."
+          Remove-Item -Recurse -Force ".release-src"
+          Remove-Item -Force "source.zip" -ErrorAction SilentlyContinue
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Release v$env:VERSION source"
+          git push origin HEAD:main
+          $sha = (git rev-parse HEAD).Trim()
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+
       - name: Publish GitHub Release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}
           VERSION: ${{ steps.version.outputs.version }}
+          TARGET_SHA: ${{ steps.source_commit.outputs.sha }}
         run: |
           gh release view "$env:TAG" --repo "$env:GITHUB_REPOSITORY" *> $null
           if ($LASTEXITCODE -eq 0) {
@@ -55,7 +92,7 @@ jobs:
           } else {
             gh release create "$env:TAG" "release/AudioDuplicate.exe" `
               --repo "$env:GITHUB_REPOSITORY" `
-              --target "$env:GITHUB_SHA" `
+              --target "$env:TARGET_SHA" `
               --title "Audio Duplicate v$env:VERSION" `
               --generate-notes
           }
