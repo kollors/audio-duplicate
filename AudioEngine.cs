@@ -10,7 +10,7 @@ namespace AudioDuplicate
     internal sealed class AudioEngine : IDisposable
     {
         private readonly object _gate = new object();
-        private WasapiLoopbackCapture _capture;
+        private ProcessLoopbackCapture _capture;
         private MMDevice _sourceDevice;
         private int _lastVolumeSyncTick;
         private readonly List<OutputWorker> _outputs = new List<OutputWorker>();
@@ -99,7 +99,7 @@ namespace AudioDuplicate
             {
                 var enumerator = new MMDeviceEnumerator();
                 _sourceDevice = enumerator.GetDevice(sourceDeviceId);
-                _capture = new WasapiLoopbackCapture(_sourceDevice);
+                _capture = new ProcessLoopbackCapture();
                 var sourceFormat = _capture.WaveFormat;
 
                 lock (_gate)
@@ -116,7 +116,11 @@ namespace AudioDuplicate
                     }
                 }
 
-                SyncOutputVolumes();
+                lock (_gate)
+                {
+                    foreach (var output in _outputs)
+                        output.NormalizeEndpointVolume();
+                }
 
                 _capture.DataAvailable += (s, e) =>
                 {
@@ -126,13 +130,6 @@ namespace AudioDuplicate
                         Interlocked.Add(ref _capturedBytes, e.BytesRecorded);
                         Interlocked.Increment(ref _capturedPackets);
 
-                        int now = Environment.TickCount;
-                        if (unchecked(now - _lastVolumeSyncTick) >= 250)
-                        {
-                            _lastVolumeSyncTick = now;
-                            SyncOutputVolumes();
-                        }
-
                         var input = new byte[e.BytesRecorded];
                         Buffer.BlockCopy(e.Buffer, 0, input, 0, e.BytesRecorded);
 
@@ -140,7 +137,23 @@ namespace AudioDuplicate
                         {
                             foreach (var worker in _outputs)
                             {
-                                var routed = RouteAudio(input, e.BytesRecorded, sourceFormat, sourceMode, worker.Mode);
+                                float sourceGain = 1f;
+                                try
+                                {
+                                    var endpointVolume = _sourceDevice.AudioEndpointVolume;
+                                    sourceGain = endpointVolume.Mute
+                                        ? 0f
+                                        : endpointVolume.MasterVolumeLevelScalar;
+                                }
+                                catch { }
+
+                                var routed = RouteAudio(
+                                    input,
+                                    e.BytesRecorded,
+                                    sourceFormat,
+                                    sourceMode,
+                                    worker.Mode,
+                                    sourceGain);
                                 worker.AddSamples(routed, routed.Length);
                                 Interlocked.Add(ref _queuedBytes, routed.Length);
                             }
@@ -205,27 +218,6 @@ namespace AudioDuplicate
             }
         }
 
-        private void SyncOutputVolumes()
-        {
-            if (_sourceDevice == null) return;
-
-            try
-            {
-                float volume = _sourceDevice.AudioEndpointVolume.MasterVolumeLevelScalar;
-                bool muted = _sourceDevice.AudioEndpointVolume.Mute;
-
-                lock (_gate)
-                {
-                    foreach (var output in _outputs)
-                        output.SyncEndpointVolume(volume, muted);
-                }
-            }
-            catch (Exception ex)
-            {
-                SetError("Не удалось синхронизировать громкость: " + ex.Message);
-            }
-        }
-
         private void SetError(string message)
         {
             lock (_gate) _lastError = message ?? "";
@@ -234,7 +226,7 @@ namespace AudioDuplicate
         public void Dispose() => Stop();
 
         private static byte[] RouteAudio(byte[] input, int bytesRecorded, WaveFormat format,
-            ChannelMode sourceMode, ChannelMode outputMode)
+            ChannelMode sourceMode, ChannelMode outputMode, float gain)
         {
             int channels = Math.Max(1, format.Channels);
             int bits = format.BitsPerSample;
@@ -295,6 +287,9 @@ namespace AudioDuplicate
                         outRight = selected;
                     }
                 }
+
+                outLeft *= gain;
+                outRight *= gain;
 
                 WriteSample(output, offset, bits, isFloat, outLeft);
                 if (channels >= 2)
@@ -380,6 +375,9 @@ namespace AudioDuplicate
             private readonly BufferedWaveProvider _buffer;
             private WasapiOut _player;
             private readonly Action<Exception> _onError;
+            private readonly float _originalMasterVolume;
+            private readonly bool _originalMute;
+            private bool _volumeNormalized;
 
             public ChannelMode Mode { get; }
 
@@ -392,6 +390,17 @@ namespace AudioDuplicate
                 _device = device;
                 Mode = mode;
                 _onError = onError;
+
+                try
+                {
+                    _originalMasterVolume = _device.AudioEndpointVolume.MasterVolumeLevelScalar;
+                    _originalMute = _device.AudioEndpointVolume.Mute;
+                }
+                catch
+                {
+                    _originalMasterVolume = 1f;
+                    _originalMute = false;
+                }
 
                 _buffer = new BufferedWaveProvider(sourceFormat)
                 {
@@ -436,15 +445,14 @@ namespace AudioDuplicate
                 return player;
             }
 
-            public void SyncEndpointVolume(float volume, bool muted)
+            public void NormalizeEndpointVolume()
             {
                 try
                 {
                     var endpoint = _device.AudioEndpointVolume;
-                    if (Math.Abs(endpoint.MasterVolumeLevelScalar - volume) > 0.001f)
-                        endpoint.MasterVolumeLevelScalar = volume;
-                    if (endpoint.Mute != muted)
-                        endpoint.Mute = muted;
+                    endpoint.MasterVolumeLevelScalar = 1f;
+                    endpoint.Mute = false;
+                    _volumeNormalized = true;
                 }
                 catch (Exception ex)
                 {
@@ -478,6 +486,18 @@ namespace AudioDuplicate
             {
                 try { _player.Stop(); } catch { }
                 _player.Dispose();
+
+                if (_volumeNormalized)
+                {
+                    try
+                    {
+                        var endpoint = _device.AudioEndpointVolume;
+                        endpoint.MasterVolumeLevelScalar = _originalMasterVolume;
+                        endpoint.Mute = _originalMute;
+                    }
+                    catch { }
+                }
+
                 _device.Dispose();
             }
         }
