@@ -14,7 +14,6 @@ namespace AudioDuplicate
         private readonly object _gate = new object();
         private WasapiRecorder _capture;
         private MMDevice _sourceDevice;
-        private SessionSilencer _sessionSilencer;
         private readonly List<OutputWorker> _outputs = new List<OutputWorker>();
         private volatile bool _running;
         private string _lastError = "";
@@ -129,25 +128,12 @@ namespace AudioDuplicate
 
                 lock (_gate)
                 {
-                    // The main endpoint is rendered by Audio Duplicate as well.
-                    // This is the key difference from v0.2.5: both physical
-                    // endpoints now travel through the same capture/render path.
-                    var primaryWorker = new OutputWorker(
-                        enumerator.GetDevice(sourceDeviceId),
-                        sourceMode,
-                        sourceFormat,
-                        isPrimary: true,
-                        ex => SetError(ex.Message));
-                    primaryWorker.Start();
-                    _outputs.Add(primaryWorker);
-
                     foreach (var route in outputs)
                     {
                         var worker = new OutputWorker(
                             enumerator.GetDevice(route.DeviceId),
                             route.Mode,
                             sourceFormat,
-                            isPrimary: false,
                             ex => SetError(ex.Message));
                         worker.Start();
                         worker.NormalizeEndpointVolume();
@@ -179,18 +165,13 @@ namespace AudioDuplicate
                         {
                             foreach (var worker in _outputs)
                             {
-                                // Primary endpoint still has its own Windows master
-                                // volume, so don't apply it twice. Additional outputs
-                                // are normalized to 100% and receive the source level
-                                // directly in PCM.
-                                float gain = worker.IsPrimary ? 1f : sourceGain;
-
                                 var routed = RouteAudio(
                                     input,
                                     input.Length,
                                     sourceFormat,
+                                    sourceMode,
                                     worker.Mode,
-                                    gain);
+                                    sourceGain);
 
                                 worker.AddSamples(routed, routed.Length);
                                 Interlocked.Add(ref _queuedBytes, routed.Length);
@@ -212,16 +193,6 @@ namespace AudioDuplicate
                 _running = true;
                 _capture.StartRecording();
 
-                // Mute the direct shared-mode render sessions on the main
-                // endpoint, excluding this process. Their audio is still
-                // captured by process-loopback and is now rendered by us to
-                // both monitors. Original mute states are restored on Stop().
-                _sessionSilencer = new SessionSilencer(
-                    _sourceDevice,
-                    unchecked((uint)Process.GetCurrentProcess().Id),
-                    ex => SetError(ex.Message));
-                _sessionSilencer.Start();
-
                 error = "";
                 return true;
             }
@@ -237,12 +208,6 @@ namespace AudioDuplicate
         public void Stop()
         {
             _running = false;
-
-            if (_sessionSilencer != null)
-            {
-                try { _sessionSilencer.Dispose(); } catch { }
-                _sessionSilencer = null;
-            }
 
             if (_capture != null)
             {
@@ -286,7 +251,8 @@ namespace AudioDuplicate
             byte[] input,
             int bytesRecorded,
             WaveFormat format,
-            ChannelMode mode,
+            ChannelMode sourceMode,
+            ChannelMode outputMode,
             float gain)
         {
             int channels = Math.Max(1, format.Channels);
@@ -314,22 +280,40 @@ namespace AudioDuplicate
                     ? ReadSample(input, offset + bytesPerSample, bits, isFloat)
                     : left;
 
-                float outLeft;
-                float outRight;
+                float outLeft = 0f;
+                float outRight = 0f;
 
-                if (mode == ChannelMode.Stereo)
+                if (sourceMode == ChannelMode.Stereo)
                 {
-                    outLeft = left;
-                    outRight = right;
+                    if (outputMode == ChannelMode.Stereo)
+                    {
+                        outLeft = left;
+                        outRight = right;
+                    }
+                    else
+                    {
+                        float mono = (left + right) * 0.5f;
+                        if (outputMode == ChannelMode.Left) outLeft = mono;
+                        else outRight = mono;
+                    }
                 }
                 else
                 {
-                    // "Left" / "Right" means which channel from the source
-                    // should be reproduced by this physical output. Duplicate
-                    // the selected channel to both speakers of that monitor.
-                    float selected = mode == ChannelMode.Left ? left : right;
-                    outLeft = selected;
-                    outRight = selected;
+                    float selected = sourceMode == ChannelMode.Left ? left : right;
+
+                    if (outputMode == ChannelMode.Stereo)
+                    {
+                        outLeft = selected;
+                        outRight = selected;
+                    }
+                    else if (outputMode == ChannelMode.Left)
+                    {
+                        outLeft = selected;
+                    }
+                    else
+                    {
+                        outRight = selected;
+                    }
                 }
 
                 outLeft *= gain;
@@ -413,149 +397,6 @@ namespace AudioDuplicate
             return value;
         }
 
-        private sealed class SessionSilencer : IDisposable
-        {
-            private readonly MMDevice _device;
-            private readonly uint _ownProcessId;
-            private readonly Action<Exception> _onError;
-            private readonly object _lock = new object();
-            private readonly Dictionary<string, MutedSession> _muted =
-                new Dictionary<string, MutedSession>(StringComparer.Ordinal);
-
-            private AudioSessionManager _manager;
-            private bool _started;
-
-            public SessionSilencer(
-                MMDevice device,
-                uint ownProcessId,
-                Action<Exception> onError)
-            {
-                _device = device;
-                _ownProcessId = ownProcessId;
-                _onError = onError;
-            }
-
-            public void Start()
-            {
-                if (_started) return;
-
-                _manager = _device.AudioSessionManager;
-                _manager.RefreshSessions();
-                _manager.OnSessionCreated += OnSessionCreated;
-                _started = true;
-
-                var sessions = _manager.Sessions;
-                if (sessions == null) return;
-
-                for (int i = 0; i < sessions.Count; i++)
-                {
-                    AudioSessionControl session = null;
-                    try
-                    {
-                        session = sessions[i];
-                        MuteSession(session);
-                        session = null; // ownership retained by _muted when muted
-                    }
-                    catch (Exception ex)
-                    {
-                        try { session?.Dispose(); } catch { }
-                        _onError?.Invoke(ex);
-                    }
-                }
-            }
-
-            private void OnSessionCreated(object sender, AudioSessionControl session)
-            {
-                try
-                {
-                    MuteSession(session);
-                }
-                catch (Exception ex)
-                {
-                    try { session?.Dispose(); } catch { }
-                    _onError?.Invoke(ex);
-                }
-            }
-
-            private void MuteSession(AudioSessionControl session)
-            {
-                if (session == null) return;
-
-                uint pid;
-                try { pid = session.GetProcessID; }
-                catch
-                {
-                    session.Dispose();
-                    return;
-                }
-
-                // Never mute Audio Duplicate's own primary render session.
-                if (pid == _ownProcessId)
-                {
-                    session.Dispose();
-                    return;
-                }
-
-                string key;
-                try { key = session.GetSessionInstanceIdentifier; }
-                catch { key = pid.ToString() + ":" + session.GetHashCode(); }
-
-                lock (_lock)
-                {
-                    if (_muted.ContainsKey(key))
-                    {
-                        session.Dispose();
-                        return;
-                    }
-
-                    bool originalMute = false;
-                    try { originalMute = session.SimpleAudioVolume.Mute; } catch { }
-
-                    try
-                    {
-                        session.SimpleAudioVolume.Mute = true;
-                        _muted[key] = new MutedSession(session, originalMute);
-                    }
-                    catch
-                    {
-                        session.Dispose();
-                        throw;
-                    }
-                }
-            }
-
-            public void Dispose()
-            {
-                if (_manager != null)
-                _manager.OnSessionCreated -= OnSessionCreated;
-
-                lock (_lock)
-                {
-                    foreach (var item in _muted.Values)
-                    {
-                        try { item.Session.SimpleAudioVolume.Mute = item.OriginalMute; } catch { }
-                        try { item.Session.Dispose(); } catch { }
-                    }
-                    _muted.Clear();
-                }
-
-                _manager = null;
-                _started = false;
-            }
-
-            private sealed class MutedSession
-            {
-                public AudioSessionControl Session { get; }
-                public bool OriginalMute { get; }
-
-                public MutedSession(AudioSessionControl session, bool originalMute)
-                {
-                    Session = session;
-                    OriginalMute = originalMute;
-                }
-            }
-        }
-
         private sealed class OutputWorker : IDisposable
         {
             private readonly MMDevice _device;
@@ -567,18 +408,15 @@ namespace AudioDuplicate
             private bool _volumeNormalized;
 
             public ChannelMode Mode { get; }
-            public bool IsPrimary { get; }
 
             public OutputWorker(
                 MMDevice device,
                 ChannelMode mode,
                 WaveFormat sourceFormat,
-                bool isPrimary,
                 Action<Exception> onError)
             {
                 _device = device;
                 Mode = mode;
-                IsPrimary = isPrimary;
                 _onError = onError;
 
                 try
