@@ -1,18 +1,22 @@
-<Project Sdk="Microsoft.NET.Sdk.WindowsDesktop">
+<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net48</TargetFramework>
+    <TargetFramework>net9.0-windows10.0.19041.0</TargetFramework>
     <UseWindowsForms>true</UseWindowsForms>
     <PlatformTarget>x64</PlatformTarget>
-    <Prefer32Bit>false</Prefer32Bit>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <PublishTrimmed>false</PublishTrimmed>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
     <LangVersion>latest</LangVersion>
     <Nullable>disable</Nullable>
     <AssemblyName>AudioDuplicate</AssemblyName>
     <RootNamespace>AudioDuplicate</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
-    <Version>0.2.4</Version>
-    <AssemblyVersion>0.2.4.0</AssemblyVersion>
-    <FileVersion>0.2.4.0</FileVersion>
+    <Version>0.2.5</Version>
+    <AssemblyVersion>0.2.5.0</AssemblyVersion>
+    <FileVersion>0.2.5.0</FileVersion>
     <Company>kollors</Company>
     <Product>Audio Duplicate</Product>
     <Description>Portable WASAPI audio output duplicator</Description>
@@ -22,6 +26,6 @@
     <DebugSymbols>false</DebugSymbols>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="NAudio" Version="2.2.1" />
+    <PackageReference Include="NAudio.Wasapi" Version="3.1.0" />
   </ItemGroup>
 </Project>
