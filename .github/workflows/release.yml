@@ -39,11 +39,40 @@ jobs:
       - name: Build
         run: msbuild AudioDuplicate.csproj /p:Configuration=Release /p:Platform=x64 /m
 
-      - name: Prepare release asset
+      - name: Prepare portable folder
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path release | Out-Null
-          Copy-Item "bin/x64/Release/net48/AudioDuplicate.exe" "release/AudioDuplicate.exe"
+          New-Item -ItemType Directory -Force -Path portable | Out-Null
+          Copy-Item "bin/x64/Release/net48/AudioDuplicate.exe" portable/
+          Copy-Item "bin/x64/Release/net48/*.dll" portable/
+          if (Test-Path "bin/x64/Release/net48/AudioDuplicate.exe.config") {
+            Copy-Item "bin/x64/Release/net48/AudioDuplicate.exe.config" portable/
+          }
+
+      - name: Microsoft Defender scan
+        shell: pwsh
+        run: |
+          $portable = (Resolve-Path "portable").Path
+          $mp = Join-Path $env:ProgramFiles "Windows Defender\MpCmdRun.exe"
+          if (-not (Test-Path $mp)) {
+            $candidate = Get-ChildItem "$env:ProgramData\Microsoft\Windows Defender\Platform\*\MpCmdRun.exe" -ErrorAction SilentlyContinue |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1
+            if ($candidate) { $mp = $candidate.FullName }
+          }
+          if (-not (Test-Path $mp)) {
+            throw "Microsoft Defender scanner is unavailable on this runner."
+          }
+          & $mp -Scan -ScanType 3 -File $portable -DisableRemediation
+          if ($LASTEXITCODE -ne 0) {
+            throw "Microsoft Defender scan failed or detected a threat. Exit code: $LASTEXITCODE"
+          }
+
+      - name: Create release ZIP
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: Compress-Archive -Path "portable/*" -DestinationPath "AudioDuplicate-v$env:VERSION-portable.zip" -Force
 
       - name: Publish GitHub Release
         shell: pwsh
@@ -52,11 +81,12 @@ jobs:
           TAG: ${{ steps.version.outputs.tag }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
+          $asset = "AudioDuplicate-v$env:VERSION-portable.zip"
           gh release view "$env:TAG" --repo "$env:GITHUB_REPOSITORY" *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload "$env:TAG" "release/AudioDuplicate.exe" --clobber --repo "$env:GITHUB_REPOSITORY"
+            gh release upload "$env:TAG" "$asset" --clobber --repo "$env:GITHUB_REPOSITORY"
           } else {
-            gh release create "$env:TAG" "release/AudioDuplicate.exe" `
+            gh release create "$env:TAG" "$asset" `
               --repo "$env:GITHUB_REPOSITORY" `
               --target "$env:GITHUB_SHA" `
               --title "Audio Duplicate v$env:VERSION" `
